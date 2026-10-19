@@ -13,7 +13,7 @@
 
 #define MAGIC_HEAD_NUM 0xFEEFF55FE55F
 #define CACHE_LINE_SIZE 64
-#define MAX_SUBCRIBE_NUM 64
+#define MAX_SUBCRIBE_NUM 32
 #define TIME_OUT (10ULL * 1000 * 1000 * 1000) // 10S
 #define IPC_HEAD_VERSION 1U
 
@@ -120,42 +120,53 @@ public:
             int buffer_size = p_head->buffer_size;
             int mask = buffer_size - 1;
             uint64_t wpos = 0;
-            int active_num = 0;
             while(!m_stop.load(std::memory_order_acquire))
             {
-                wpos = channel_atomic::load(&p_head->pub_pos);
-                active_num = channel_atomic::load(&p_head->active_sub_num);
-                if(0 == active_num){
-                    min_sub_pos.store(wpos, std::memory_order_release);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                    continue;
-                }
-
-                uint64_t min_pos = buffer_size;
+                uint64_t min_pos = 0;
+                bool has_active_subscriber = false;
                 uint64_t rpos = 0;
-                wpos = channel_atomic::load(&p_head->pub_pos);
 
-                for (auto i=0; i<active_num; ++i) {
-                    auto &item =  p_head->sub_item[i];
-                    
+                for (int i = 0; i < MAX_SUBCRIBE_NUM; ++i) {
+                    auto &item = p_head->sub_item[i];
+
                     if(channel_atomic::load(&item.is_active) != 2) continue;
 
                     rpos = channel_atomic::load(&item.sub_pos);
-                    min_pos = std::min<uint64_t>(min_pos, rpos);
+                    wpos = channel_atomic::load(&p_head->pub_pos);
 
                     // 判断是否阻塞生产，判活
-                    if( (wpos-rpos) > static_cast<uint64_t>(mask) ) {
-                        if( (get_ns_monotonic() - channel_atomic::load(&item.curr_ts)) > TIME_OUT ){
-                            channel_atomic::store(&item.is_active, uint8_t{0});
-                            channel_atomic::fetch_sub(&p_head->active_sub_num, uint64_t{1});
+                    if ((wpos - rpos) > static_cast<uint64_t>(mask)) {
+                        uint64_t last_seen = channel_atomic::load(&item.curr_ts);
+                        uint64_t now = get_ns_monotonic();
+                        if (now - last_seen > TIME_OUT &&
+                            last_seen == channel_atomic::load(&item.curr_ts)) {
+                            uint8_t expected = 2;
+                            if (channel_atomic::compare_exchange(
+                                    &item.is_active, &expected, uint8_t{0})) {
+                                channel_atomic::fetch_sub(
+                                    &p_head->active_sub_num, uint64_t{1});
+                            }
+                            continue;
                         }
                     }
+
+                    if (!has_active_subscriber) {
+                        min_pos = rpos;
+                        has_active_subscriber = true;
+                    } else {
+                        min_pos = std::min<uint64_t>(min_pos, rpos);
+                    }
+                }
+
+                if (!has_active_subscriber) {
+                    min_pos = channel_atomic::load(&p_head->pub_pos);
                 }
                 this->min_sub_pos.store(min_pos, std::memory_order_release);
 
                 // 读写频率不高时候可以休眠下，降低CPU负载
-                if( (wpos - min_pos)*3 > mask ) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                wpos = channel_atomic::load(&p_head->pub_pos);
+                if(has_active_subscriber && (wpos - min_pos)*3 > mask) {
+                    std::this_thread::sleep_for(std::chrono::nanoseconds(1));
                 }
             }
         });
@@ -170,7 +181,7 @@ public:
         }
         // 最慢订阅者的可读空间长度
         uint64_t avialbe_wlen = m_wpos - m_rpos;
-        if(avialbe_wlen > m_buffer_size) {
+        if (avialbe_wlen > static_cast<uint64_t>(m_buffer_size)) {
             // 系统错误
             return -3;
         }
@@ -182,7 +193,7 @@ public:
             m_rpos = min_sub_pos.load(std::memory_order_acquire);
             //再次计算
             avialbe_wlen = m_wpos - m_rpos;
-            if(avialbe_wlen > m_buffer_size) {
+            if(avialbe_wlen > static_cast<uint64_t>(m_buffer_size)) {
                 // 系统错误
                 return -3;
             }
@@ -214,8 +225,10 @@ public:
 
     int get_avialbe_publish_len() const
     {
-        uint64_t occupied = channel_atomic::load(&p_head->pub_pos) -
-                            min_sub_pos.load(std::memory_order_acquire);
+        uint64_t pub_pos = channel_atomic::load(&p_head->pub_pos);
+        uint64_t min_pos = min_sub_pos.load(std::memory_order_acquire);
+        uint64_t occupied = pub_pos - min_pos;
+        if (occupied > static_cast<uint64_t>(m_buffer_size)) return 0;
         return static_cast<int>(m_buffer_size - occupied);
     }
 
