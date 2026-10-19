@@ -120,10 +120,12 @@ public:
             int buffer_size = p_head->buffer_size;
             int mask = buffer_size - 1;
             uint64_t wpos = 0;
+            int active_num = 0;
             while(!m_stop.load(std::memory_order_acquire))
             {
                 wpos = channel_atomic::load(&p_head->pub_pos);
-                if(0 == channel_atomic::load(&p_head->active_sub_num)){
+                active_num = channel_atomic::load(&p_head->active_sub_num);
+                if(0 == active_num){
                     min_sub_pos.store(wpos, std::memory_order_release);
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     continue;
@@ -133,7 +135,8 @@ public:
                 uint64_t rpos = 0;
                 wpos = channel_atomic::load(&p_head->pub_pos);
 
-                for (auto &item : p_head->sub_item) {
+                for (auto i=0; i<active_num; ++i) {
+                    auto &item =  p_head->sub_item[i];
                     
                     if(channel_atomic::load(&item.is_active) != 2) continue;
 
@@ -356,8 +359,3 @@ public:
     }
 
 };
-
-int test(){
-   auto v0 =  sizeof(IPCHeadInfo);
-   auto v1 =  sizeof(IPCHeadInfo);
-}
