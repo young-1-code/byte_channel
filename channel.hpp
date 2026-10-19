@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include "mem_region.hpp"
 
 #define MAGIC_HEAD_NUM 0xFEEFF55FE55F
 #define CACHE_LINE_SIZE 64
@@ -51,6 +52,7 @@ private:
     uint8_t     *p_all_buffer;
     uint8_t     *p_buffer;
     IPCHeadInfo *p_head;
+    MemoryRegion m_memory;
     std::thread _th;
     uint64_t    m_wpos, m_rpos;
     std::atomic<bool> m_stop{false};
@@ -64,11 +66,10 @@ public:
     {
         m_stop.store(true, std::memory_order_release);
         if (_th.joinable()) _th.join();
-        delete[] p_all_buffer;
     }
 
     // 线程间通信
-    int create(int buffer_size, std::string &topic_name)
+    int create(int buffer_size, const std::string &topic_name, const MemoryType &type)
     {
         // 1.判断是否是2的此幂
         if (buffer_size <= 0 ||
@@ -79,7 +80,19 @@ public:
         if (m_created) return -1;
         
         int actual_szie = buffer_size + sizeof(IPCHeadInfo);
-        p_all_buffer = new uint8_t[actual_szie];
+        if (type == MemoryType::Thread){
+            if (m_memory.create_thread(static_cast<size_t>(actual_szie)) != 0) {
+                return -2;
+            }
+        }else if (type == MemoryType::Shared) {
+            if (m_memory.create_shared(topic_name, static_cast<size_t>(actual_szie)) != 0) {
+                return -2;
+            }
+        }else{
+            // 非法参数
+            return -1;
+        }
+        p_all_buffer = static_cast<uint8_t *>(m_memory.data());
         
         p_head = (IPCHeadInfo*)p_all_buffer;
         p_head->pub_pos.store(0, std::memory_order_release);
@@ -219,6 +232,7 @@ private:
     IPCHeadInfo *p_head;
     SubcribeItem *item;
     uint64_t     m_wpos, m_rpos;
+    MemoryRegion m_memory;
 public:
     Subscriber()
         : m_buffer_size(0), m_mask(0), p_all_buffer(nullptr), p_buffer(nullptr),
@@ -226,6 +240,14 @@ public:
 
     ~Subscriber() { unsubscribe(); }
 
+    // 进程间订阅，共享内存
+    int subscribe(const std::string &topic_name)
+    {
+        m_memory.open_shared(topic_name);
+        return subscribe(m_memory.data());
+    }
+
+    // 进程内订阅
     int subscribe(void *shared_memory)
     {
         if (item != nullptr) return -1;
