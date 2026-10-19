@@ -132,24 +132,33 @@ public:
         if( len > m_buffer_size || p_data == nullptr || len < 1){
             return -1;
         }
-
-        int rpos = (m_rpos&m_mask);
-        int wpos = (m_wpos&m_mask);
-        uint64_t avialbe_wlen = (rpos - wpos + m_buffer_size)&m_mask;
+        // 最慢订阅者的可读空间长度
+        uint64_t avialbe_wlen = m_wpos - m_rpos;
+        if(avialbe_wlen > m_buffer_size) {
+            // 系统错误
+            return -3;
+        }
+        // 可写空间长度
+        avialbe_wlen = m_buffer_size - avialbe_wlen;
         if (avialbe_wlen < len) {
             //刷新数据
             m_wpos = p_head->pub_pos.load(std::memory_order_acquire);
             m_rpos = min_sub_pos.load(std::memory_order_acquire);
             //再次计算
-            rpos = (m_rpos&m_mask);
-            wpos = (m_wpos&m_mask);
-            avialbe_wlen = (rpos - wpos + m_buffer_size)&m_mask;
+            avialbe_wlen = m_wpos - m_rpos;
+            if(avialbe_wlen > m_buffer_size) {
+                // 系统错误
+                return -3;
+            }
+            avialbe_wlen = m_buffer_size - avialbe_wlen;
             // 再次判断
-            if (avialbe_wlen < len){
+            if (avialbe_wlen < len) {
                 // 可写入空间不足
                 return -2;
             }
         }
+        
+        int wpos = (m_wpos&m_mask);
 
         int mask = m_buffer_size - 1;
 
@@ -217,16 +226,14 @@ public:
             }
         }
 
-        int mask  = m_buffer_size - 1;
-        int _wpos = m_wpos & mask;
-        int _rpos = m_rpos & mask;
+        int rpos = m_rpos & m_mask;
 
-        int right_avb_len = m_buffer_size - _rpos;
+        int right_avb_len = m_buffer_size - rpos;
 
         if (right_avb_len >= len) {
-            ::memcpy(p_data, p_buffer+_rpos, len);
+            ::memcpy(p_data, p_buffer+rpos, len);
         }else{
-            ::memcpy(p_data, p_buffer+_rpos, right_avb_len);
+            ::memcpy(p_data, p_buffer+rpos, right_avb_len);
             ::memcpy(p_data+right_avb_len, p_buffer, len-right_avb_len);
         }
 
