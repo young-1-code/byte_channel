@@ -46,10 +46,12 @@ class Pulisher {
 private:
     alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> min_sub_pos; //最慢订阅者消费的位置
     int         m_buffer_size;
+    int         m_mask;
     uint8_t     *p_all_buffer;
     uint8_t     *p_buffer;
     IPCHeadInfo *p_head;
     std::thread _th;
+    uint64_t    m_wpos, m_rpos;
 public:
     Pulisher()
     {
@@ -131,17 +133,25 @@ public:
             return -1;
         }
 
-        uint64_t wpos = p_head->pub_pos.load(std::memory_order_acquire);
-        uint64_t min_rpos = min_sub_pos.load(std::memory_order_acquire);
-        uint64_t avialbe_wlen = wpos - min_rpos;
+        int rpos = (m_rpos&m_mask);
+        int wpos = (m_wpos&m_mask);
+        uint64_t avialbe_wlen = (rpos - wpos + m_buffer_size)&m_mask;
         if (avialbe_wlen < len) {
-            // 可写入空间不足
-            return -2;
+            //刷新数据
+            m_wpos = p_head->pub_pos.load(std::memory_order_acquire);
+            m_rpos = min_sub_pos.load(std::memory_order_acquire);
+            //再次计算
+            rpos = (m_rpos&m_mask);
+            wpos = (m_wpos&m_mask);
+            avialbe_wlen = (rpos - wpos + m_buffer_size)&m_mask;
+            // 再次判断
+            if (avialbe_wlen < len){
+                // 可写入空间不足
+                return -2;
+            }
         }
 
         int mask = m_buffer_size - 1;
-        wpos     = wpos & mask;
-        min_rpos = min_rpos & mask;
 
         int right_avb_len = m_buffer_size - wpos;
 
@@ -153,6 +163,7 @@ public:
         }
 
         p_head->pub_pos.fetch_add(len, std::memory_order_release);
+        m_wpos += len;
 
         return 0;
     }
@@ -163,7 +174,67 @@ public:
     }
 };
 
-class subscriber {
+class Subscriber 
+{
+private:
+    int         m_buffer_size;
+    int         m_mask;
+    uint8_t     *p_all_buffer;
+    uint8_t     *p_buffer;
+    IPCHeadInfo *p_head;
+    SubcribeItem *item;
+    uint64_t     m_wpos, m_rpos;
+public:
+    Subscriber()
+    {
+
+    }
+
+    ~Subscriber()
+    {
+
+    }
+
+    int subcribe(char* p_data, int len)
+    {
+        // 参数校验
+        if( len > m_buffer_size || p_data == nullptr || len < 1){
+            return -1;
+        }
+
+        //本地缓存加载计算
+        uint64_t avialbe_wlen = m_wpos - m_rpos;
+        if (avialbe_wlen < len) {
+            // 远端数据更新计算
+            m_wpos = p_head->pub_pos.load(std::memory_order_acquire);
+            m_rpos = item->sub_pos.load(std::memory_order_acquire);
+            // 再次计算
+            avialbe_wlen = m_wpos - m_rpos;
+            // 再次校验
+            if (avialbe_wlen < len){
+                // 可写入空间不足
+                return -2;
+            }
+        }
+
+        int mask  = m_buffer_size - 1;
+        int _wpos = m_wpos & mask;
+        int _rpos = m_rpos & mask;
+
+        int right_avb_len = m_buffer_size - _rpos;
+
+        if (right_avb_len >= len) {
+            ::memcpy(p_data, p_buffer+_rpos, len);
+        }else{
+            ::memcpy(p_data, p_buffer+_rpos, right_avb_len);
+            ::memcpy(p_data+right_avb_len, p_buffer, len-right_avb_len);
+        }
+
+        item->sub_pos.fetch_add(len, std::memory_order_release);
+        m_rpos += len;
+
+        return 0;
+    }
 
 };
 
