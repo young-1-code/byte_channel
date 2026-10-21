@@ -2,6 +2,9 @@
 
 #include "channel.hpp"
 
+#include <memory>
+#include <new>
+
 // SPSC 专用通道：只支持一个生产者和一个消费者。
 // 复用 channel.hpp 的共享内存头部布局，但不启动后台线程，也不扫描订阅者。
 class SpscPublisher {
@@ -128,6 +131,9 @@ private:
     MemoryRegion m_memory;
     uint64_t m_wpos = 0;
     uint64_t m_rpos = 0;
+    std::unique_ptr<char[]> m_single_max_buffer;
+    int      m_single_max_size = 0;
+    int      m_last_read_size_lock = 0;
 
     int attach(void *shared_memory)
     {
@@ -170,6 +176,7 @@ private:
         m_mask = 0;
         m_wpos = 0;
         m_rpos = 0;
+        m_last_read_size_lock = 0;
     }
 
 public:
@@ -188,12 +195,93 @@ public:
 
     int unsubscribe()
     {
+        if(m_single_max_buffer){
+            m_single_max_buffer.reset();
+            m_single_max_size = 0;
+        }
         reset();
+        return 0;
+    }
+
+    int enable_pop_lock_mode(int single_max_block_size)
+    {
+        if(single_max_block_size > m_buffer_size || single_max_block_size < 1){
+            return -1;
+        }
+        if(m_single_max_buffer== nullptr) {
+            std::unique_ptr<char[]> buffer(
+                new (std::nothrow) char[single_max_block_size]);
+            if (buffer == nullptr) {
+                return -2;
+            }
+            m_single_max_size = single_max_block_size;
+            m_single_max_buffer = std::move(buffer);
+            return 0;
+        }
+        return -2;
+    }
+
+    const char* try_pop_lock(int len)
+    {
+        if (m_single_max_buffer == nullptr || len > m_single_max_size){
+            return nullptr;
+        }
+
+        if (len < 1 || len > m_buffer_size || item == nullptr) {
+            return nullptr;
+        }
+
+        // 未释放锁
+        if( m_last_read_size_lock > 0 ){
+            return nullptr;
+        }
+
+        // curr_ts 仅保留 mem head 的兼容字段；SPSC 不用它判断消费者状态。
+        channel_atomic::store(&item->curr_ts, get_ns_monotonic());
+        // 没有可读数据时刷新生产者位置，避免每次都访问共享内存。
+        uint64_t available = m_wpos - m_rpos;
+        if (available < static_cast<uint64_t>(len)) {
+            m_wpos = channel_atomic::load(&p_head->pub_pos);
+            available = m_wpos - m_rpos;
+            if (available < static_cast<uint64_t>(len)) return nullptr;
+        }
+
+        // 数据可能跨越环形缓冲区尾部，需要拆分读取。
+        int offset = static_cast<int>(m_rpos & static_cast<uint64_t>(m_mask));
+        int right_available = m_buffer_size - offset;
+        m_last_read_size_lock = len;
+        if (right_available >= len) {
+            return (char*)(p_buffer + offset);
+        } else {
+            ::memcpy(m_single_max_buffer.get(), p_buffer + offset, right_available);
+            ::memcpy(
+                m_single_max_buffer.get() + right_available,
+                p_buffer,
+                len - right_available);
+            return m_single_max_buffer.get();
+        }
+        return nullptr;
+    }
+
+    int pop_unlock()
+    {
+        if(m_last_read_size_lock < 1 || !item){
+            return -1;
+        }
+        // 先完成本地消费，再发布新的 sub_pos 给生产者。
+        m_rpos += static_cast<uint64_t>(m_last_read_size_lock);
+        channel_atomic::store(&item->sub_pos, m_rpos);
+        m_last_read_size_lock = 0;
         return 0;
     }
 
     int try_pop(char *data, int len)
     {
+        // lock 模式读取，不能混用，未释放锁
+        if ( m_last_read_size_lock > 0 ) {
+            return -1;
+        }
+
         if (data == nullptr || len < 1 || len > m_buffer_size || item == nullptr) {
             return -1;
         }
