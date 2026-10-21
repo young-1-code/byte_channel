@@ -4,13 +4,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
+#include <csignal>
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <csignal>
 #include <thread>
-#include <vector>
 
 namespace {
 
@@ -20,7 +18,8 @@ struct Message {
 };
 
 constexpr int kBufferSize = 1 << 20;
-constexpr int kDefaultReportInterval = 3;
+constexpr int kDefaultDuration = 10;
+constexpr int kDefaultReportInterval = 1;
 
 std::atomic<bool> g_stop{false};
 
@@ -40,95 +39,23 @@ int parse_positive_int(const char *value, int fallback)
     return static_cast<int>(parsed);
 }
 
-bool run_atomic_benchmark()
+void fill_message(Message &message, uint64_t sequence)
 {
-    uint64_t counter = 0;
-    constexpr int thread_count = 8;
-    constexpr int increments_per_thread = 1'000'000;
-    std::vector<std::thread> workers;
-    workers.reserve(thread_count);
-
-    for (int i = 0; i < thread_count; ++i) {
-        workers.emplace_back([&counter] {
-            for (int j = 0; j < increments_per_thread; ++j) {
-                channel_atomic::fetch_add(&counter, uint64_t{1});
-            }
-        });
+    message.sequence = sequence;
+    for (size_t index = 0; index < sizeof(message.payload); ++index) {
+        message.payload[index] = static_cast<char>((sequence + index) & 0xff);
     }
-    for (auto &worker : workers) worker.join();
-
-    uint64_t expected = static_cast<uint64_t>(thread_count) * increments_per_thread;
-    std::cout << "atomic counter: " << counter << " / " << expected << '\n';
-    return counter == expected;
 }
 
-bool run_channel_benchmark(int report_interval)
+bool valid_message(const Message &message, uint64_t expected_sequence)
 {
-    SpscPublisher publisher;
-    const std::string topic = "spsc_channel_benchmark";
-    if (publisher.create(kBufferSize, topic, MemoryType::Thread) != 0) {
-        std::cerr << "failed to create publisher\n";
-        return false;
-    }
-
-    SpscSubscriber subscriber;
-    if (subscriber.subscribe(publisher.shared_memory()) != 0) {
-        std::cerr << "failed to subscribe\n";
-        return false;
-    }
-
-    auto report_time = std::chrono::steady_clock::now() +
-        std::chrono::seconds(report_interval);
-    auto interval_start = std::chrono::steady_clock::now();
-    uint64_t produced = 0;
-    uint64_t consumed = 0;
-    uint64_t sequence = 0;
-    while (!g_stop.load(std::memory_order_acquire)) {
-        Message message{};
-        message.sequence = sequence;
-
-        if (publisher.publish(
-                reinterpret_cast<const char *>(&message), sizeof(message)) != 0) {
-            std::cerr << "failed to publish\n";
+    if (message.sequence != expected_sequence) return false;
+    for (size_t index = 0; index < sizeof(message.payload); ++index) {
+        if (message.payload[index] !=
+            static_cast<char>((expected_sequence + index) & 0xff)) {
             return false;
         }
-        ++produced;
-
-        Message received{};
-        if (subscriber.subcribe(
-                reinterpret_cast<char *>(&received), sizeof(received)) != 0 ||
-            received.sequence != sequence) {
-            std::cerr << "failed to consume\n";
-            return false;
-        }
-        ++consumed;
-        ++sequence;
-
-        auto now = std::chrono::steady_clock::now();
-        if (now >= report_time) {
-            double elapsed = std::chrono::duration<double>(
-                now - interval_start).count();
-            double messages_per_second = elapsed > 0.0
-                ? consumed / elapsed
-                : 0.0;
-            double mib_per_second =
-                messages_per_second * sizeof(Message) / (1024.0 * 1024.0);
-            std::cout << std::fixed << std::setprecision(2)
-                      << "interval=" << elapsed << " s, "
-                      << "spsc=" << messages_per_second << " msg/s, "
-                      << "bandwidth=" << mib_per_second << " MiB/s, "
-                      << "produced=" << produced << ", "
-                      << "consumed=" << consumed << '\n'
-                      << std::flush;
-            interval_start = now;
-            produced = 0;
-            consumed = 0;
-            report_time = now + std::chrono::seconds(report_interval);
-        }
     }
-
-    std::cout << "stopped: produced=" << produced
-              << ", consumed=" << consumed << '\n';
     return true;
 }
 
@@ -136,14 +63,134 @@ bool run_channel_benchmark(int report_interval)
 
 int main(int argc, char **argv)
 {
-    int report_interval = argc > 1
-        ? parse_positive_int(argv[1], kDefaultReportInterval)
+    int duration = argc > 1
+        ? parse_positive_int(argv[1], kDefaultDuration)
+        : kDefaultDuration;
+    int report_interval = argc > 2
+        ? parse_positive_int(argv[2], kDefaultReportInterval)
         : kDefaultReportInterval;
 
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
-    bool atomic_ok = run_atomic_benchmark();
-    bool channel_ok = run_channel_benchmark(report_interval);
-    return atomic_ok && channel_ok ? 0 : 1;
+    SpscPublisher publisher;
+    if (publisher.create(kBufferSize, "spsc_channel_benchmark", MemoryType::Thread) != 0) {
+        std::cerr << "failed to create spsc publisher\n";
+        return 1;
+    }
+
+    SpscSubscriber subscriber;
+    if (subscriber.subscribe(publisher.shared_memory()) != 0) {
+        std::cerr << "failed to create spsc subscriber\n";
+        return 1;
+    }
+
+    std::atomic<bool> failed{false};
+    std::atomic<uint64_t> produced{0};
+    std::atomic<uint64_t> consumed{0};
+    std::atomic<uint64_t> publish_retries{0};
+    std::atomic<uint64_t> consume_retries{0};
+    std::atomic<bool> producer_done{false};
+
+    std::thread producer([&] {
+        Message message{};
+        uint64_t sequence = 0;
+        while (!g_stop.load(std::memory_order_acquire) &&
+               !failed.load(std::memory_order_acquire)) {
+            fill_message(message, sequence);
+            int result = publisher.publish(
+                reinterpret_cast<const char *>(&message), sizeof(message));
+            if (result == 0) {
+                produced.fetch_add(1, std::memory_order_relaxed);
+                ++sequence;
+            } else if (result == -2) {
+                publish_retries.fetch_add(1, std::memory_order_relaxed);
+                std::this_thread::yield();
+            } else {
+                failed.store(true, std::memory_order_release);
+            }
+        }
+        producer_done.store(true, std::memory_order_release);
+    });
+
+    std::thread consumer([&] {
+        Message message{};
+        uint64_t expected_sequence = 0;
+        while (!failed.load(std::memory_order_acquire) &&
+               (!g_stop.load(std::memory_order_acquire) ||
+                !producer_done.load(std::memory_order_acquire) ||
+                consumed.load(std::memory_order_relaxed) <
+                    produced.load(std::memory_order_relaxed))) {
+            int result = subscriber.subcribe(
+                reinterpret_cast<char *>(&message), sizeof(message));
+            if (result == 0) {
+                if (!valid_message(message, expected_sequence)) {
+                    failed.store(true, std::memory_order_release);
+                    break;
+                }
+                consumed.fetch_add(1, std::memory_order_relaxed);
+                ++expected_sequence;
+            } else if (result == -2) {
+                consume_retries.fetch_add(1, std::memory_order_relaxed);
+                std::this_thread::yield();
+            } else {
+                failed.store(true, std::memory_order_release);
+            }
+        }
+    });
+
+    auto start = std::chrono::steady_clock::now();
+    auto report_time = start + std::chrono::seconds(report_interval);
+    auto deadline = start + std::chrono::seconds(duration);
+    uint64_t previous_consumed = 0;
+    auto previous_time = start;
+
+    while (!g_stop.load(std::memory_order_acquire) &&
+           !failed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        auto now = std::chrono::steady_clock::now();
+        if (now < report_time) continue;
+
+        double elapsed = std::chrono::duration<double>(now - previous_time).count();
+        uint64_t current_produced = produced.load(std::memory_order_relaxed);
+        uint64_t current_consumed = consumed.load(std::memory_order_relaxed);
+        double messages_per_second = elapsed > 0.0
+            ? (current_consumed - previous_consumed) / elapsed
+            : 0.0;
+        double mib_per_second =
+            messages_per_second * sizeof(Message) / (1024.0 * 1024.0);
+
+        std::cout << std::fixed << std::setprecision(2)
+                  << "interval=" << elapsed << " s, "
+                  << "spsc=" << messages_per_second << " msg/s, "
+                  << "bandwidth=" << mib_per_second << " MiB/s, "
+                  << "produced=" << current_produced << ", "
+                  << "consumed=" << current_consumed << '\n'
+                  << std::flush;
+
+        previous_time = now;
+        previous_consumed = current_consumed;
+        report_time = now + std::chrono::seconds(report_interval);
+    }
+
+    g_stop.store(true, std::memory_order_release);
+    producer.join();
+    consumer.join();
+
+    uint64_t final_produced = produced.load(std::memory_order_relaxed);
+    uint64_t final_consumed = consumed.load(std::memory_order_relaxed);
+    std::cout << "summary: produced=" << final_produced
+              << ", consumed=" << final_consumed
+              << ", publish_retries="
+              << publish_retries.load(std::memory_order_relaxed)
+              << ", consume_retries="
+              << consume_retries.load(std::memory_order_relaxed) << '\n';
+
+    if (failed.load(std::memory_order_acquire) ||
+        final_produced != final_consumed) {
+        std::cerr << "spsc benchmark failed\n";
+        return 1;
+    }
+    return 0;
 }
