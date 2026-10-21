@@ -14,10 +14,10 @@ int main()
     assert(subscriber.subscribe(publisher.shared_memory()) == 0);
 
     const char message[] = "hello channel";
-    assert(publisher.publish(message, sizeof(message)) == 0);
+    assert(publisher.try_push(message, sizeof(message)) == 0);
 
     char received[sizeof(message)] = {};
-    assert(subscriber.subcribe(received, sizeof(received)) == 0);
+    assert(subscriber.try_pop(received, sizeof(received)) == 0);
     assert(std::memcmp(received, message, sizeof(message)) == 0);
 
     std::cout << "received: " << received << '\n';

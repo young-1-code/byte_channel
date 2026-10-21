@@ -99,7 +99,7 @@ int main(int argc, char **argv)
         while (!g_stop.load(std::memory_order_acquire) &&
                !failed.load(std::memory_order_acquire)) {
             fill_message(message, sequence);
-            int result = publisher.publish(
+            int result = publisher.try_push(
                 reinterpret_cast<const char *>(&message), sizeof(message));
             if (result == 0) {
                 ++produced;
@@ -122,7 +122,7 @@ int main(int argc, char **argv)
                 !producer_done.load(std::memory_order_acquire) ||
                 consumed.load(std::memory_order_relaxed) <
                     produced.load(std::memory_order_relaxed))) {
-            int result = subscriber.subcribe(
+            int result = subscriber.try_pop(
                 reinterpret_cast<char *>(&message), sizeof(message));
             if (result == 0) {
                 if (!valid_message(message, expected_sequence)) {

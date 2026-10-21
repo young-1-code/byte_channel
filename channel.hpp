@@ -173,7 +173,7 @@ public:
         return 0;
     }
 
-    int publish(const char* p_data, int len)
+    int try_push(const char* p_data, int len)
     {
         // 参数校验
         if( len > m_buffer_size || p_data == nullptr || len < 1){
@@ -326,7 +326,7 @@ public:
         return 0;
     }
 
-    int subcribe(char* p_data, int len)
+    int try_pop(char* p_data, int len)
     {
         // 参数校验
         if( len > m_buffer_size || p_data == nullptr || len < 1){

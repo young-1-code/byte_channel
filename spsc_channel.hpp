@@ -76,7 +76,7 @@ public:
         return 0;
     }
 
-    int publish(const char *data, int len)
+    int try_push(const char *data, int len)
     {
         if (!m_created || data == nullptr || len < 1 || len > m_buffer_size) {
             return -1;
@@ -192,7 +192,7 @@ public:
         return 0;
     }
 
-    int subcribe(char *data, int len)
+    int try_pop(char *data, int len)
     {
         if (data == nullptr || len < 1 || len > m_buffer_size || item == nullptr) {
             return -1;
