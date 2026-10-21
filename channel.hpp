@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <new>
 #include <string>
 #include <thread>
 
@@ -247,10 +249,14 @@ private:
     SubcribeItem *item;
     uint64_t     m_wpos, m_rpos;
     MemoryRegion m_memory;
+    std::unique_ptr<char[]> m_single_max_buffer;
+    int         m_single_max_size;
+    int         m_last_read_size_lock;
 public:
     Subscriber()
         : m_buffer_size(0), m_mask(0), p_all_buffer(nullptr), p_buffer(nullptr),
-          p_head(nullptr), item(nullptr), m_wpos(0), m_rpos(0) {}
+          p_head(nullptr), item(nullptr), m_wpos(0), m_rpos(0),
+          m_single_max_size(0), m_last_read_size_lock(0) {}
 
     ~Subscriber() { unsubscribe(); }
 
@@ -311,10 +317,14 @@ public:
 
     int unsubscribe()
     {
-        if (item == nullptr) return 0;
-        if (channel_atomic::exchange(&item->is_active, uint8_t{0}) == 2) {
-            channel_atomic::fetch_sub(&p_head->active_sub_num, uint64_t{1});
+        if (item != nullptr) {
+            if (channel_atomic::exchange(&item->is_active, uint8_t{0}) == 2) {
+                channel_atomic::fetch_sub(&p_head->active_sub_num, uint64_t{1});
+            }
         }
+        m_single_max_buffer.reset();
+        m_single_max_size = 0;
+        m_last_read_size_lock = 0;
         item = nullptr;
         p_head = nullptr;
         p_buffer = nullptr;
@@ -326,8 +336,75 @@ public:
         return 0;
     }
 
+    int enable_pop_lock_mode(int single_max_block_size)
+    {
+        if (single_max_block_size < 1 ||
+            single_max_block_size > m_buffer_size) {
+            return -1;
+        }
+        if (m_single_max_buffer != nullptr) return -2;
+
+        std::unique_ptr<char[]> buffer(
+            new (std::nothrow) char[single_max_block_size]);
+        if (buffer == nullptr) return -2;
+
+        m_single_max_size = single_max_block_size;
+        m_single_max_buffer = std::move(buffer);
+        return 0;
+    }
+
+    const char* try_pop_lock(int len)
+    {
+        if (m_single_max_buffer == nullptr ||
+            len < 1 || len > m_single_max_size ||
+            len > m_buffer_size || item == nullptr || p_head == nullptr ||
+            channel_atomic::load(&item->is_active) != 2 ||
+            m_last_read_size_lock > 0) {
+            return nullptr;
+        }
+
+        channel_atomic::store(&item->curr_ts, get_ns_monotonic());
+
+        uint64_t available = m_wpos - m_rpos;
+        if (available < static_cast<uint64_t>(len)) {
+            m_wpos = channel_atomic::load(&p_head->pub_pos);
+            m_rpos = channel_atomic::load(&item->sub_pos);
+            available = m_wpos - m_rpos;
+            if (available < static_cast<uint64_t>(len)) return nullptr;
+        }
+
+        int rpos = static_cast<int>(m_rpos & static_cast<uint64_t>(m_mask));
+        int right_available = m_buffer_size - rpos;
+        m_last_read_size_lock = len;
+        if (right_available >= len) {
+            return reinterpret_cast<const char *>(p_buffer + rpos);
+        }
+
+        ::memcpy(m_single_max_buffer.get(), p_buffer + rpos, right_available);
+        ::memcpy(
+            m_single_max_buffer.get() + right_available,
+            p_buffer,
+            len - right_available);
+        return m_single_max_buffer.get();
+    }
+
+    int pop_unlock()
+    {
+        if (m_last_read_size_lock < 1 || item == nullptr || p_head == nullptr ||
+            channel_atomic::load(&item->is_active) != 2) {
+            return -1;
+        }
+
+        m_rpos += static_cast<uint64_t>(m_last_read_size_lock);
+        channel_atomic::store(&item->sub_pos, m_rpos);
+        m_last_read_size_lock = 0;
+        return 0;
+    }
+
     int try_pop(char* p_data, int len)
     {
+        if (m_last_read_size_lock > 0) return -1;
+
         // 参数校验
         if( len > m_buffer_size || p_data == nullptr || len < 1){
             return -1;
