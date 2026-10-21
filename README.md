@@ -142,6 +142,10 @@ g++ -O2 -std=c++17 -pthread -I. benchmark/channel_benchmark.cpp -o /tmp/channel_
 # SPSC 压力测试（含数据完整性校验）
 g++ -O2 -std=c++17 -pthread -I. benchmark/spsc_channel_stress.cpp -o /tmp/spsc_stress
 /tmp/spsc_stress 10 1
+
+# 进程间共享内存压测：父进程生产、子进程消费
+g++ -O2 -std=c++17 -pthread -I. benchmark/ipc_channel_benchmark.cpp -o /tmp/ipc_channel_bench
+/tmp/ipc_channel_bench 3             # 参数：时长（秒）
 ```
 
 输出字段：`interval`、`spsc`（msg/s）、`bandwidth`（MiB/s）、`produced` / `consumed`、重试次数、`status`。
