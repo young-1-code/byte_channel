@@ -53,15 +53,16 @@ bool valid_message(const char *message, int size, uint64_t sequence)
     return true;
 }
 
-template <bool UsePopLock>
+template <typename Publisher, typename Subscriber, bool UsePopLock>
 Result run_case(int message_size, int duration_seconds, int max_block_size)
 {
-    SpscPublisher publisher;
-    if (publisher.create(kBufferSize, "spsc_pop_lock_benchmark", MemoryType::Thread) != 0) {
+    Publisher publisher;
+    if (publisher.create(
+            kBufferSize, "pop_lock_benchmark", MemoryType::Thread) != 0) {
         return {.failed = true};
     }
 
-    SpscSubscriber subscriber;
+    Subscriber subscriber;
     if (subscriber.subscribe(publisher.shared_memory()) != 0) {
         return {.failed = true};
     }
@@ -155,6 +156,7 @@ Result run_case(int message_size, int duration_seconds, int max_block_size)
 }
 
 void print_result(
+    const char *channel,
     const char *mode,
     int message_size,
     int duration_seconds,
@@ -165,6 +167,7 @@ void print_result(
     double mib_per_second =
         messages_per_second * message_size / (1024.0 * 1024.0);
     std::cout << std::fixed << std::setprecision(2)
+              << "channel=" << channel << ", "
               << "mode=" << mode << ", "
               << "message_size=" << message_size << ", "
               << "interval=" << duration_seconds << " s, "
@@ -195,12 +198,26 @@ int main(int argc, char **argv)
               << ", pop_lock_max_block=" << max_block_size << '\n';
 
     for (int message_size : {64, 256, 1024, 4096}) {
-        Result copy_result = run_case<false>(
+        Result generic_copy_result = run_case<Pulisher, Subscriber, false>(
             message_size, duration_seconds, max_block_size);
-        Result lock_result = run_case<true>(
+        Result generic_lock_result = run_case<Pulisher, Subscriber, true>(
             message_size, duration_seconds, max_block_size);
-        print_result("copy", message_size, duration_seconds, copy_result);
-        print_result("pop_lock", message_size, duration_seconds, lock_result);
+        Result spsc_copy_result = run_case<SpscPublisher, SpscSubscriber, false>(
+            message_size, duration_seconds, max_block_size);
+        Result spsc_lock_result = run_case<SpscPublisher, SpscSubscriber, true>(
+            message_size, duration_seconds, max_block_size);
+        print_result(
+            "generic", "copy", message_size, duration_seconds,
+            generic_copy_result);
+        print_result(
+            "generic", "pop_lock", message_size, duration_seconds,
+            generic_lock_result);
+        print_result(
+            "spsc", "copy", message_size, duration_seconds,
+            spsc_copy_result);
+        print_result(
+            "spsc", "pop_lock", message_size, duration_seconds,
+            spsc_lock_result);
     }
     return 0;
 }
