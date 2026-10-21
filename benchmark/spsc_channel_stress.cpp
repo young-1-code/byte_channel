@@ -104,7 +104,7 @@ int main(int argc, char **argv)
             if (result == 0) {
                 ++produced;
                 ++sequence;
-            } else if (result == -2) {
+            } else if (result == channel_status::kWouldBlock) {
                 ++publish_retries;
                 std::this_thread::yield();
             } else {
@@ -131,7 +131,7 @@ int main(int argc, char **argv)
                 }
                 ++consumed;
                 ++expected_sequence;
-            } else if (result == -2) {
+            } else if (result == channel_status::kWouldBlock) {
                 ++consume_retries;
                 std::this_thread::yield();
             } else {

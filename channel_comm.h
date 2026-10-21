@@ -4,6 +4,19 @@
 #include <ctime>
 #include <type_traits>
 
+namespace channel_status {
+
+inline constexpr int kOk = 0;
+inline constexpr int kInvalidArgument = -1;
+inline constexpr int kWouldBlock = -2;
+inline constexpr int kSystemError = -3;
+inline constexpr int kNoSubscriber = -4;
+inline constexpr int kNotInitialized = -5;
+inline constexpr int kAlreadyExists = -6;
+inline constexpr int kNoMemory = -7;
+
+}
+
 // 共享内存中的原子字段必须是固定宽度、无对象生命周期的整数类型。
 // 这些封装使用 GCC/Clang __atomic builtin，不依赖 std::atomic 对象布局。
 namespace channel_atomic {

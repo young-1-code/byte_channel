@@ -92,7 +92,7 @@ Result run_case(int message_size, int duration_seconds, int max_block_size)
             if (status == 0) {
                 produced.fetch_add(1, std::memory_order_relaxed);
                 ++sequence;
-            } else if (status == -2) {
+            } else if (status == channel_status::kWouldBlock) {
                 publish_retries.fetch_add(1, std::memory_order_relaxed);
                 std::this_thread::yield();
             } else {
@@ -132,7 +132,7 @@ Result run_case(int message_size, int duration_seconds, int max_block_size)
                 }
                 consumed.fetch_add(1, std::memory_order_relaxed);
                 ++expected_sequence;
-            } else if (status == -2) {
+            } else if (status == channel_status::kWouldBlock) {
                 consume_retries.fetch_add(1, std::memory_order_relaxed);
                 std::this_thread::yield();
             } else {

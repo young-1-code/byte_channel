@@ -73,22 +73,21 @@ public:
         if (buffer_size <= 0 ||
             (buffer_size & (buffer_size-1)) != 0 ||
             buffer_size > static_cast<int>(std::numeric_limits<int>::max() - sizeof(IPCHeadInfo))) {
-            return -1;
+            return channel_status::kInvalidArgument;
         }
-        if (m_created) return -1;
+        if (m_created) return channel_status::kInvalidArgument;
         
         int actual_szie = buffer_size + sizeof(IPCHeadInfo);
         if (type == MemoryType::Thread){
-            if (m_memory.create_thread(static_cast<size_t>(actual_szie)) != 0) {
-                return -2;
-            }
+            int result = m_memory.create_thread(static_cast<size_t>(actual_szie));
+            if (result != channel_status::kOk) return result;
         }else if (type == MemoryType::Shared) {
-            if (m_memory.create_shared(topic_name, static_cast<size_t>(actual_szie)) != 0) {
-                return -2;
-            }
+            int result = m_memory.create_shared(
+                topic_name, static_cast<size_t>(actual_szie));
+            if (result != channel_status::kOk) return result;
         }else{
             // 非法参数
-            return -1;
+            return channel_status::kInvalidArgument;
         }
         p_all_buffer = static_cast<uint8_t *>(m_memory.data());
         
@@ -172,20 +171,20 @@ public:
                 }
             }
         });
-        return 0;
+        return channel_status::kOk;
     }
 
     int try_push(const char* p_data, int len)
     {
         // 参数校验
         if( len > m_buffer_size || p_data == nullptr || len < 1){
-            return -1;
+            return channel_status::kInvalidArgument;
         }
         // 最慢订阅者的可读空间长度
         uint64_t avialbe_wlen = m_wpos - m_rpos;
         if (avialbe_wlen > static_cast<uint64_t>(m_buffer_size)) {
             // 系统错误
-            return -3;
+            return channel_status::kSystemError;
         }
         // 可写空间长度
         avialbe_wlen = m_buffer_size - avialbe_wlen;
@@ -197,13 +196,13 @@ public:
             avialbe_wlen = m_wpos - m_rpos;
             if(avialbe_wlen > static_cast<uint64_t>(m_buffer_size)) {
                 // 系统错误
-                return -3;
+                return channel_status::kSystemError;
             }
             avialbe_wlen = m_buffer_size - avialbe_wlen;
             // 再次判断
             if (avialbe_wlen < len) {
                 // 可写入空间不足
-                return -2;
+                return channel_status::kWouldBlock;
             }
         }
         
@@ -222,7 +221,7 @@ public:
         channel_atomic::store(&p_head->curr_ts, get_ns_monotonic());
         m_wpos += len;
 
-        return 0;
+        return channel_status::kOk;
     }
 
     int get_avialbe_publish_len() const
@@ -263,15 +262,16 @@ public:
     // 进程间订阅，共享内存
     int subscribe(const std::string &topic_name)
     {
-        m_memory.open_shared(topic_name);
+        int result = m_memory.open_shared(topic_name);
+        if (result != channel_status::kOk) return result;
         return subscribe(m_memory.data());
     }
 
     // 进程内订阅
     int subscribe(void *shared_memory)
     {
-        if (item != nullptr) return -1;
-        if (shared_memory == nullptr) return -1;
+        if (item != nullptr) return channel_status::kInvalidArgument;
+        if (shared_memory == nullptr) return channel_status::kInvalidArgument;
 
         p_all_buffer = static_cast<uint8_t *>(shared_memory);
         p_head = reinterpret_cast<IPCHeadInfo *>(p_all_buffer);
@@ -283,7 +283,7 @@ public:
             (p_head->buffer_size & (p_head->buffer_size - 1)) != 0) {
             p_all_buffer = nullptr;
             p_head = nullptr;
-            return -1;
+            return channel_status::kInvalidArgument;
         }
 
         p_buffer = p_all_buffer + sizeof(IPCHeadInfo);
@@ -308,11 +308,11 @@ public:
             p_head = nullptr;
             m_buffer_size = 0;
             m_mask = 0;
-            return -2;
+            return channel_status::kNoSubscriber;
         }
         m_rpos = channel_atomic::load(&item->sub_pos);
         m_wpos = channel_atomic::load(&p_head->pub_pos);
-        return 0;
+        return channel_status::kOk;
     }
 
     int unsubscribe()
@@ -333,24 +333,26 @@ public:
         m_mask = 0;
         m_wpos = 0;
         m_rpos = 0;
-        return 0;
+        return channel_status::kOk;
     }
 
     int enable_pop_lock_mode(int single_max_block_size)
     {
         if (single_max_block_size < 1 ||
             single_max_block_size > m_buffer_size) {
-            return -1;
+            return channel_status::kInvalidArgument;
         }
-        if (m_single_max_buffer != nullptr) return -2;
+        if (m_single_max_buffer != nullptr) {
+            return channel_status::kInvalidArgument;
+        }
 
         std::unique_ptr<char[]> buffer(
             new (std::nothrow) char[single_max_block_size]);
-        if (buffer == nullptr) return -2;
+        if (buffer == nullptr) return channel_status::kNoMemory;
 
         m_single_max_size = single_max_block_size;
         m_single_max_buffer = std::move(buffer);
-        return 0;
+        return channel_status::kOk;
     }
 
     const char* try_pop_lock(int len)
@@ -392,27 +394,29 @@ public:
     {
         if (m_last_read_size_lock < 1 || item == nullptr || p_head == nullptr ||
             channel_atomic::load(&item->is_active) != 2) {
-            return -1;
+            return channel_status::kInvalidArgument;
         }
 
         m_rpos += static_cast<uint64_t>(m_last_read_size_lock);
         channel_atomic::store(&item->sub_pos, m_rpos);
         m_last_read_size_lock = 0;
-        return 0;
+        return channel_status::kOk;
     }
 
     int try_pop(char* p_data, int len)
     {
-        if (m_last_read_size_lock > 0) return -1;
+        if (m_last_read_size_lock > 0) {
+            return channel_status::kInvalidArgument;
+        }
 
         // 参数校验
         if( len > m_buffer_size || p_data == nullptr || len < 1){
-            return -1;
+            return channel_status::kInvalidArgument;
         }
 
         if (item == nullptr || p_head == nullptr ||
             channel_atomic::load(&item->is_active) != 2) {
-            return -3;
+            return channel_status::kSystemError;
         }
         channel_atomic::store(&item->curr_ts, get_ns_monotonic());
 
@@ -427,7 +431,7 @@ public:
             // 再次校验
             if (avialbe_wlen < len){
                 // 可写入空间不足
-                return -2;
+                return channel_status::kWouldBlock;
             }
         }
 
@@ -445,7 +449,7 @@ public:
         channel_atomic::fetch_add(&item->sub_pos, static_cast<uint64_t>(len));
         m_rpos += len;
 
-        return 0;
+        return channel_status::kOk;
     }
 
 };

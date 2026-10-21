@@ -103,7 +103,7 @@ int main(int argc, char **argv)
             if (result == 0) {
                 produced.fetch_add(1, std::memory_order_relaxed);
                 ++sequence;
-            } else if (result == -2) {
+            } else if (result == channel_status::kWouldBlock) {
                 publish_retries.fetch_add(1, std::memory_order_relaxed);
                 std::this_thread::yield();
             } else {
@@ -130,7 +130,7 @@ int main(int argc, char **argv)
                 }
                 consumed.fetch_add(1, std::memory_order_relaxed);
                 ++expected_sequence;
-            } else if (result == -2) {
+            } else if (result == channel_status::kWouldBlock) {
                 consume_retries.fetch_add(1, std::memory_order_relaxed);
                 std::this_thread::yield();
             } else {

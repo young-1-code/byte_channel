@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <utility>
 
+#include "channel_comm.h"
+
 inline constexpr const char *DEFAULT_SHARED_MEMORY_PREFIX = "/dev/shm/btchanel";
 
 // 内存区域类型。Thread 使用进程内堆内存，Shared 使用文件映射内存。
@@ -120,17 +122,17 @@ public:
     // 创建当前进程内使用的堆内存。
     int create_thread(size_t size)
     {
-        if (size == 0 || m_address != nullptr) return -1;
+        if (size == 0 || m_address != nullptr) return channel_status::kInvalidArgument;
         void *address = ::operator new(size, std::nothrow);
-        if (address == nullptr) return -2;
+        if (address == nullptr) return channel_status::kNoMemory;
         m_address = address;
         m_size = size;
         m_type = MemoryType::Thread;
-        return 0;
+        return channel_status::kOk;
     }
 
     // 创建共享文件并映射到当前进程。
-    // 返回 -2 表示 topic 已经存在，调用方应改用 open_shared。
+    // 返回 kAlreadyExists 表示 topic 已经存在，调用方应改用 open_shared。
     int create_shared(
         const std::string &topic,
         size_t size,
@@ -139,21 +141,27 @@ public:
     {
         std::string path = make_shared_path(topic, prefix);
         if (path.empty() || size == 0 || m_address != nullptr ||
-            size > static_cast<size_t>(std::numeric_limits<off_t>::max())) return -1;
-        if (!ensure_prefix(prefix, 0770)) return -1;
+            size > static_cast<size_t>(std::numeric_limits<off_t>::max())) {
+            return channel_status::kInvalidArgument;
+        }
+        if (!ensure_prefix(prefix, 0770)) return channel_status::kSystemError;
 
         int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, mode);
-        if (fd < 0) return errno == EEXIST ? -2 : -3;
+        if (fd < 0) {
+            return errno == EEXIST
+                ? channel_status::kAlreadyExists
+                : channel_status::kSystemError;
+        }
         if (::ftruncate(fd, static_cast<off_t>(size)) != 0) {
             ::close(fd);
             ::unlink(path.c_str());
-            return -4;
+            return channel_status::kSystemError;
         }
         void *address = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (address == MAP_FAILED) {
             ::close(fd);
             ::unlink(path.c_str());
-            return -5;
+            return channel_status::kSystemError;
         }
         m_address = address;
         m_size = size;
@@ -161,7 +169,7 @@ public:
         m_type = MemoryType::Shared;
         m_name = path;
         m_owner = true;
-        return 0;
+        return channel_status::kOk;
     }
 
     // 打开已经存在的共享文件并映射到当前进程。
@@ -170,26 +178,28 @@ public:
         const std::string &prefix = DEFAULT_SHARED_MEMORY_PREFIX)
     {
         std::string path = make_shared_path(topic, prefix);
-        if (path.empty() || m_address != nullptr) return -1;
+        if (path.empty() || m_address != nullptr) {
+            return channel_status::kInvalidArgument;
+        }
         int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC, 0);
-        if (fd < 0) return -2;
+        if (fd < 0) return channel_status::kSystemError;
         struct stat status {};
         if (::fstat(fd, &status) != 0 || status.st_size <= 0) {
             ::close(fd);
-            return -3;
+            return channel_status::kSystemError;
         }
         size_t size = static_cast<size_t>(status.st_size);
         void *address = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (address == MAP_FAILED) {
             ::close(fd);
-            return -4;
+            return channel_status::kSystemError;
         }
         m_address = address;
         m_size = size;
         m_fd = fd;
         m_type = MemoryType::Shared;
         m_name = path;
-        return 0;
+        return channel_status::kOk;
     }
 
     void *data() const { return m_address; }

@@ -37,7 +37,7 @@ public:
             buffer_size > static_cast<int>(
                 std::numeric_limits<int>::max() - sizeof(IPCHeadInfo)) ||
             m_created) {
-            return -1;
+            return channel_status::kInvalidArgument;
         }
 
         // mem head 与数据区连续分配，保持和普通 channel 的布局兼容。
@@ -46,8 +46,8 @@ public:
             ? m_memory.create_thread(actual_size)
             : type == MemoryType::Shared
                 ? m_memory.create_shared(topic_name, actual_size)
-                : -1;
-        if (result != 0) return result == -1 ? -1 : -2;
+                : channel_status::kInvalidArgument;
+        if (result != channel_status::kOk) return result;
 
         p_all_buffer = static_cast<uint8_t *>(m_memory.data());
         p_head = reinterpret_cast<IPCHeadInfo *>(p_all_buffer);
@@ -76,24 +76,26 @@ public:
         m_wpos = 0;
         m_rpos = 0;
         m_created = true;
-        return 0;
+        return channel_status::kOk;
     }
 
     int try_push(const char *data, int len)
     {
         if (!m_created || data == nullptr || len < 1 || len > m_buffer_size) {
-            return -1;
+            return channel_status::kInvalidArgument;
         }
 
         SubcribeItem *item = subscriber_item();
-        if (item == nullptr) return -2;
+        if (item == nullptr) return channel_status::kNoSubscriber;
 
         // 先使用生产者本地缓存；空间不足时再从消费者同步 sub_pos。
         uint64_t available = m_buffer_size - (m_wpos - m_rpos);
         if (available < static_cast<uint64_t>(len)) {
             m_rpos = channel_atomic::load(&item->sub_pos);
             available = m_buffer_size - (m_wpos - m_rpos);
-            if (available < static_cast<uint64_t>(len)) return -2;
+            if (available < static_cast<uint64_t>(len)) {
+                return channel_status::kWouldBlock;
+            }
         }
 
         // 数据可能跨越环形缓冲区尾部，因此需要拆成两次 memcpy。
@@ -109,7 +111,7 @@ public:
         m_wpos += static_cast<uint64_t>(len);
         channel_atomic::store(&p_head->pub_pos, m_wpos);
         channel_atomic::store(&p_head->curr_ts, get_ns_monotonic());
-        return 0;
+        return channel_status::kOk;
     }
 
     void *shared_memory() const { return p_all_buffer; }
@@ -137,7 +139,9 @@ private:
 
     int attach(void *shared_memory)
     {
-        if (shared_memory == nullptr || item != nullptr) return -1;
+        if (shared_memory == nullptr || item != nullptr) {
+            return channel_status::kInvalidArgument;
+        }
 
         p_all_buffer = static_cast<uint8_t *>(shared_memory);
         p_head = reinterpret_cast<IPCHeadInfo *>(p_all_buffer);
@@ -149,7 +153,7 @@ private:
                 std::numeric_limits<int>::max()) ||
             (p_head->buffer_size & (p_head->buffer_size - 1)) != 0) {
             reset();
-            return -1;
+            return channel_status::kInvalidArgument;
         }
 
         // SPSC 不计算 is_active，调用方负责保证只有一个消费者连接。
@@ -163,7 +167,7 @@ private:
         channel_atomic::store(
             &candidate->curr_ts, get_ns_monotonic(), __ATOMIC_RELAXED);
         item = candidate;
-        return 0;
+        return channel_status::kOk;
     }
 
     void reset()
@@ -200,25 +204,25 @@ public:
             m_single_max_size = 0;
         }
         reset();
-        return 0;
+        return channel_status::kOk;
     }
 
     int enable_pop_lock_mode(int single_max_block_size)
     {
         if(single_max_block_size > m_buffer_size || single_max_block_size < 1){
-            return -1;
+            return channel_status::kInvalidArgument;
         }
         if(m_single_max_buffer== nullptr) {
             std::unique_ptr<char[]> buffer(
                 new (std::nothrow) char[single_max_block_size]);
             if (buffer == nullptr) {
-                return -2;
+                return channel_status::kNoMemory;
             }
             m_single_max_size = single_max_block_size;
             m_single_max_buffer = std::move(buffer);
-            return 0;
+            return channel_status::kOk;
         }
-        return -2;
+        return channel_status::kInvalidArgument;
     }
 
     const char* try_pop_lock(int len)
@@ -266,24 +270,24 @@ public:
     int pop_unlock()
     {
         if(m_last_read_size_lock < 1 || !item){
-            return -1;
+            return channel_status::kInvalidArgument;
         }
         // 先完成本地消费，再发布新的 sub_pos 给生产者。
         m_rpos += static_cast<uint64_t>(m_last_read_size_lock);
         channel_atomic::store(&item->sub_pos, m_rpos);
         m_last_read_size_lock = 0;
-        return 0;
+        return channel_status::kOk;
     }
 
     int try_pop(char *data, int len)
     {
         // lock 模式读取，不能混用，未释放锁
         if ( m_last_read_size_lock > 0 ) {
-            return -1;
+            return channel_status::kInvalidArgument;
         }
 
         if (data == nullptr || len < 1 || len > m_buffer_size || item == nullptr) {
-            return -1;
+            return channel_status::kInvalidArgument;
         }
 
         // curr_ts 仅保留 mem head 的兼容字段；SPSC 不用它判断消费者状态。
@@ -293,7 +297,9 @@ public:
         if (available < static_cast<uint64_t>(len)) {
             m_wpos = channel_atomic::load(&p_head->pub_pos);
             available = m_wpos - m_rpos;
-            if (available < static_cast<uint64_t>(len)) return -2;
+            if (available < static_cast<uint64_t>(len)) {
+                return channel_status::kWouldBlock;
+            }
         }
 
         // 数据可能跨越环形缓冲区尾部，需要拆分读取。
@@ -309,6 +315,6 @@ public:
         // 先完成本地消费，再发布新的 sub_pos 给生产者。
         m_rpos += static_cast<uint64_t>(len);
         channel_atomic::store(&item->sub_pos, m_rpos);
-        return 0;
+        return channel_status::kOk;
     }
 };

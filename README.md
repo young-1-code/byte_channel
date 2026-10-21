@@ -21,7 +21,6 @@ header-only 的 C++17 字节流通道库。基于无锁环形缓冲区提供线�
 ├── channel_comm.h         channel_atomic 跨进程原子封装、get_ns_monotonic 时间戳
 ├── example/               最小使用示例
 ├── benchmark/             压测程序
-└── PROJECT_MEMORY.md      接口约定与压测记录
 ```
 
 ## 快速开始
@@ -107,14 +106,18 @@ while (running) {
 | `try_pop_lock(len)` / `pop_unlock()` | 零拷贝读取 / 提交消费位置 |
 | `unsubscribe()` | 退订（析构时自动调用） |
 
-返回码约定（`try_push` / `try_pop` / `subscribe`）：
+统一返回码定义在 `channel_comm.h` 的 `channel_status` 命名空间中。适用于 `create`、`try_push`、`try_pop`、`subscribe`、`enable_pop_lock_mode` 和 `pop_unlock`：
 
 | 返回值 | 含义 |
 | --- | --- |
-| `0` | 成功 |
-| `-1` | 参数非法或状态错误（长度越界、未订阅、重复创建等） |
-| `-2` | 资源不足：push 可写空间不足 / pop 可读数据不足（可稍后重试）；通用通道订阅槽位已满 |
-| `-3` | 通用通道读写位置一致性异常（系统错误） |
+| `channel_status::kOk` (`0`) | 成功 |
+| `channel_status::kInvalidArgument` (`-1`) | 参数非法或当前状态不允许操作 |
+| `channel_status::kWouldBlock` (`-2`) | 暂时不可完成：缓冲区空间不足或数据不足，可稍后重试 |
+| `channel_status::kSystemError` (`-3`) | 系统错误或读写位置一致性异常 |
+| `channel_status::kNoSubscriber` (`-4`) | 没有可用订阅者槽位 |
+| `channel_status::kNotInitialized` (`-5`) | 对象尚未初始化 |
+| `channel_status::kAlreadyExists` (`-6`) | 共享内存 topic 已存在 |
+| `channel_status::kNoMemory` (`-7`) | 内存分配失败 |
 
 ## 约束与注意事项
 
@@ -143,7 +146,7 @@ g++ -O2 -std=c++17 -pthread -I. benchmark/spsc_channel_stress.cpp -o /tmp/spsc_s
 
 输出字段：`interval`、`spsc`（msg/s）、`bandwidth`（MiB/s）、`produced` / `consumed`、重试次数、`status`。
 
-最近一次 3 秒压测（见 `PROJECT_MEMORY.md`）：两种消费模式均通过数据完整性校验；pop_lock 在 64 字节块下吞吐约为普通 `try_pop` 的 2 倍，数据块增大后收益逐步收敛。
+最近一次 3 秒压测中，两种消费模式均通过数据完整性校验；pop_lock 在 64 字节块下吞吐约为普通 `try_pop` 的 2 倍，数据块增大后收益逐步收敛。
 
 ## 依赖
 
