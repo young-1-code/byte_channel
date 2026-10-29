@@ -16,6 +16,10 @@ MVP 的目标是先保证以下性质：
 
 暂不包含压缩、动态多 Topic 管理、跨节点认证和复杂带宽调度。
 
+UDP 对外接口沿用现有 IPC channel 的调用风格：Pub 提供 `create`、`try_push`、`close` 等生产接口，Sub 提供 `subscribe`、`try_pop`、`try_pop_lock`、`pop_unlock`、`unsubscribe` 等消费接口，并继续使用 `channel_status` 返回码。UDP 网络引擎允许使用 `.cpp` 实现，应用线程不直接操作 socket。
+
+实现使用 C++20。现有 `core/ipc/spsc_channel.hpp` 保持不修改；UDP 侧通过派生适配类增加按 offset 写入、连续提交和远端 `sub_pos` 更新能力。
+
 ## 2. 核心容量模型
 
 ### 2.1 缓冲区容量
@@ -25,10 +29,10 @@ MVP 使用：
 ```text
 Pub retention buffer：8 MiB
 Sub local buffer：     8 MiB
-可用水位：             小于 8 MiB（必须预留安全余量）
+可用水位：             8 MiB（由 commit/consumed offset 背压保护）
 ```
 
-8 MiB 是 2 的幂，Pub 和 Sub 使用相同容量。Pub buffer 可以实现为两个 4 MiB segment，也可以实现为一个 8 MiB 环形缓冲。MVP 更建议使用两个带生命周期的 segment：一个 ACTIVE、一个 SEALED。由于 Pub 和 Sub 容量相同，不能把全部 8 MiB 当作安全可写空间，必须扣除在途包、乱序窗口和定时确认的余量。
+8 MiB 是 2 的幂，Pub 和 Sub 使用相同容量。Pub retention buffer 使用单个 8 MiB 环形缓冲，不采用两个 4 MiB segment。可回收空间由 Sub 的 `consumed_offset` 和连续提交位置直接决定，不额外扣除固定安全水位。
 
 ### 2.2 两种 offset
 
@@ -92,29 +96,17 @@ Sub 应用线程
 
 ## 4. Pub 端设计
 
-### 4.1 Segment 状态
+### 4.1 环形保留区
 
-如果采用两个 4 MiB segment，每个 segment 包含：
+Pub 使用单个 8 MiB 环形保留区，累计 `write_offset` 和 `reclaim_offset` 使用单调递增的字节 offset，实际内存位置通过 `offset & (8MiB - 1)` 映射。应用生产线程只能写入尚未被活跃 Sub 消费确认的空间；UDP engine 只能读取已经发布的前缀。
 
-```cpp
-struct PubSegment {
-    uint64_t segment_id;
-    uint64_t start_offset;
-    uint64_t published_offset;
-    uint8_t* data;
-    enum State { FREE, ACTIVE, SEALED } state;
-};
-```
-
-状态转换：
+环形区允许回绕，但回绕前必须满足：
 
 ```text
-FREE -> ACTIVE -> SEALED -> FREE
+write_offset - reclaim_offset + frame_size <= PUB_WATERMARK
 ```
 
-ACTIVE 只能由应用生产线程写入。数据发布后，UDP engine 可以读取已经完成的前缀。ACTIVE 写满或达到切换条件后变为 SEALED，之后内容不可修改。
-
-SEALED segment 只有在所有活跃 Sub 的 `consumed_offset` 都超过它的 `published_offset` 后，才能回收为 FREE。
+其中 `PUB_WATERMARK` 小于 8 MiB，并预留在途包、乱序窗口和定时确认所需的安全余量。不得因为数据已经发出就回收，只有所有活跃 Sub 的 `consumed_offset` 都超过对应数据范围后才能覆盖。
 
 ### 4.2 Pub 写入流控
 
@@ -125,7 +117,7 @@ write_offset - reclaim_offset + frame_size
     <= PUB_WATERMARK
 ```
 
-如果不满足，返回 `WOULD_BLOCK` 或暂停生产。不能覆盖旧 segment，也不能因为 UDP engine 已经发出数据就回收。
+如果不满足，返回 `WOULD_BLOCK` 或暂停生产。不能覆盖尚未被最慢 Sub 确认的数据，也不能因为 UDP engine 已经发出数据就回收。
 
 如果某个 Sub 长时间不发送 UPDATE，默认 10 秒判定为失联：
 
@@ -231,6 +223,18 @@ consumed_offset
 
 UPDATE 必须单调递增，重复 UPDATE 可以安全处理。
 
+### 5.4 首次建立与重连
+
+Sub 首次发送 `SETUP` 时不携带恢复位置，Pub 在 `ESTABLISH` 中返回当前最新发布位置；Sub 从该位置开始接收，不回放建立之前的数据。
+
+Sub 重连时允许在 `SETUP` 中携带 `resume_offset`。Pub 必须校验该位置是否仍在保留区可恢复范围内：
+
+- 位置有效且未被回收：`ESTABLISH` 返回该位置，Sub 从该位置继续接收；
+- 位置早于 `reclaim_offset`、晚于当前已发布位置或发生整数溢出：拒绝恢复并发送 `RST`，Sub 保持未建立状态；
+- 旧 `stream_epoch` 的恢复请求、DATA、NAK 和 UPDATE 全部丢弃。
+
+恢复位置只能从缺口起点或更早位置开始，不能从 Pub 当前最新位置跳过尚未恢复的数据。`resume_offset` 由 Sub 的连续可消费位置维护，不能使用乱序写入位置代替。
+
 ## 6. NAK 设计
 
 NAK 通过单播发送给 Pub，包含：
@@ -302,7 +306,7 @@ INIT
   -> SETUP_SENT    重新建立
 ```
 
-SETUP、ESTABLISH、RST、EXIT 必须幂等，重复控制包不能破坏状态。
+SETUP、ESTABLISH、RST、HEARTBEAT、EXIT 必须幂等，重复控制包不能破坏状态。首次 SETUP 与携带 `resume_offset` 的重连 SETUP 使用同一消息类型，由字段是否存在区分。Sub 建立后每秒发送 HEARTBEAT；主动退订发送 EXIT；Pub 超过 10 秒未收到 UPDATE 或 HEARTBEAT 时剔除 Sub 并发送 RST。
 
 ## 9. Linux 网络引擎
 
@@ -329,7 +333,7 @@ sendmmsg
 5. 应用停止消费后，Pub 在接近 8 MiB 未确认数据并扣除安全余量时停止写入，不覆盖旧数据。
 6. Sub 重启或 Pub 重置后，旧 epoch 的 DATA/NAK 都会被丢弃。
 7. NAK 超范围、未来 offset、非法长度不会触发异常重传。
-8. 两个 4 MiB segment 轮换时，未确认 segment 不会被覆盖。
+8. 单个 8 MiB 环形保留区回绕时，未确认数据不会被覆盖。
 9. `UPDATE` 只反映应用已经消费完成的 offset。
 10. 在最大 UDP payload 下不产生 IP 分片。
 11. 缺口连续两次 NAK 未恢复时，Sub 不跳过数据，发送 RST 并重新建立流。
@@ -340,5 +344,113 @@ Pub 8 MiB、Sub 8 MiB、以应用消费位置作为 UPDATE 的设计可以满足
 
 1. Pub 按最慢 Sub 的 `consumed_offset` 保留数据；
 2. UDP engine 的发送位置不能代替远端消费确认位置；
-3. 超过小于 8 MiB 的安全水位后必须停写或返回 `WOULD_BLOCK`，不能覆盖旧数据。
+3. 当 8 MiB 中没有可回收空间时必须停写或返回 `WOULD_BLOCK`，不能覆盖旧数据。
+
+## 12. 已确认的实现约束
+
+以下约束已经确定，作为 MVP 的实现基线：
+
+### 12.1 语言、目录和分层边界
+
+- 使用 C++20 实现。
+- `core/udp/engine/system/` 只处理 UDP 系统调用，不理解 Pub/Sub 协议状态：socket 创建与关闭、bind、非阻塞设置、组播加入、地址转换、`sendto/recvfrom`、`epoll` 和收发缓冲区配置都放在这里。
+- `core/udp/` 保存 UDP 公共抽象：协议头和 payload 编解码、命令与 flags、CRC、公共配置、offset/range 类型和传输端点抽象。
+- `core/udp/` 保存 Pub/Sub 控制逻辑：发布保留区、订阅者表、流控、SETUP/ESTABLISH、UPDATE、NAK、RST、乱序直写、连续提交和恢复状态机。Pub/Sub 使用独立实现文件，不额外增加 `impl/` 目录。
+- `core/udp/udp_pub.h`、`core/udp/udp_sub.h` 提供公共 API；system 目录不提供业务对象。
+- `core/udp/proto.h/.cpp` 只负责协议数据和序列化，不调用 socket，不保存运行状态。
+- `core/ipc/channel.hpp` 和 `core/ipc/spsc_channel.hpp` 保持不变。UDP 需要的可读/可写长度、消费位置、按 offset 直写和连续提交能力全部通过 `core/udp/udp_spsc_adapter.h` 中的派生类实现，不把 UDP 协议语义塞进 IPC 通道。
+- SPSC buffer 只保存纯数据流，协议头、offset、CRC、缺口和重传状态由 `core/udp` 自己维护。
+
+目标目录：
+
+```text
+core/udp/
+  proto.h                 # 公共协议类型、命令、flags、payload 类型
+  proto.cpp               # 网络字节序、CRC、协议编解码
+  udp_pub.h               # UdpPublisher 公共 API 与配置
+  udp_sub.h               # UdpSubscriber 公共 API 与配置
+  udp_pub.cpp             # Pub 状态机、保留区、发送与控制处理
+  udp_sub.cpp             # Sub 状态机、缺口表、NAK 与连续提交
+  udp_spsc_adapter.h      # UDP 对 SPSC 的适配，不修改 IPC 源码
+  engine/system/
+    udp_socket.h          # fd 生命周期、bind、选项、send/recv
+    udp_socket.cpp
+    udp_endpoint.h        # 地址、组播、数据/控制 socket
+    udp_endpoint.cpp
+```
+
+对外接口采用：
+
+```cpp
+UdpPublisher::create(const UdpPubConfig&)
+UdpPublisher::try_push(const char*, int)
+UdpPublisher::get_available_publish_len()
+UdpPublisher::close()
+
+UdpSubscriber::subscribe(const UdpSubConfig&)
+UdpSubscriber::try_pop(char*, int)
+UdpSubscriber::try_pop_lock(int)
+UdpSubscriber::pop_unlock()
+UdpSubscriber::unsubscribe()
+```
+
+Pub 和 Sub 的应用线程与 UDP engine 都通过 `SpscPublisher/SpscSubscriber` 解耦。UDP engine 使用 `UdpSpscPublisher/UdpSpscSubscriber` 派生适配类提供 `try_write_at(offset, data, len)`、`commit_until(committed_offset)`、消费位置查询和位置重置；通用 IPC 类不增加 UDP 专用接口。
+
+### 12.2 缓冲区与流控
+
+- Pub retention buffer 固定为 8 MiB。
+- Sub 本地 buffer 固定为 8 MiB。
+- 两端不允许配置其他容量，也不允许配置成不同容量。
+- 不额外设置 7 MiB 安全水位；`commit_pos`、`consumed_offset` 和 SPSC 回收位置直接形成背压。
+- `try_push` 允许超过单个 UDP payload 的长度，Pub 自动切分为多个 DATA 包。
+- `try_push/try_pop` 保持 IPC channel 的纯字节流语义，不保留调用边界。
+
+### 12.3 网络 socket 与地址模式
+
+Pub/Sub 各使用两个 UDP socket：
+
+```text
+data_socket
+control_socket
+```
+
+- DATA 支持 IPv4 组播和 IPv4 单播，由配置中的 `data_mode` 决定。
+- 组播模式下，Sub 将 data socket 绑定到 `0.0.0.0:data_port` 并加入指定组播组；`interface_address` 必填且必须是合法 IPv4 地址。
+- 单播模式下，Sub 的 data socket 同样绑定 `0.0.0.0:data_port`；`data_port == 0` 时使用系统分配的临时端口，并在 SETUP 中上报实际 endpoint。
+- 单播 DATA 的目标 endpoint 由 Sub 在 SETUP 中上报，Pub 为每个 Sub 独立保存。
+- Pub control socket 绑定 `0.0.0.0:control_port`。
+- Sub control socket 绑定 `0.0.0.0:0`，由系统分配临时端口。
+- 控制消息使用单播：SETUP、UPDATE、NAK、ESTABLISH、RST、HEARTBEAT、EXIT。
+
+默认 `max_payload` 为 1200 字节，可配置到 1400 字节，但必须根据实际 MTU 避免 IPv4 分片。
+
+### 12.4 身份与流生命周期
+
+- `topic_id` 使用固定 FNV-1a 32-bit。
+- `sub_id` 为调用方传入的稳定 `uint32_t`，在同一 Pub 流内唯一；相同 `sub_id` 的新 SETUP 视为重连并替换旧 endpoint。
+- `stream_id` 在 Pub `create()` 时生成随机非零 `uint32_t`，生命周期内保持不变。
+- `stream_epoch` 初始值为 1；每次重置或重新建立流时递增，溢出时跳过 0。
+- `packet_seq` 在每个 epoch 内从 0 开始递增。
+- 首次 SETUP 不携带恢复位置，ESTABLISH 返回 Pub 当前最新发布位置。
+- 重连 SETUP 可以携带 `resume_offset`；Pub 校验可恢复范围，失效时发送 RST。
+
+### 12.5 CRC32 与缺口处理
+
+- CRC32 可配置，默认开启。
+- 使用 CRC-32/IEEE 802.3 参数和 256 项预生成查找表。
+- 校验范围为“基础头中除 checksum 外的全部字段 + payload”。
+- CRC32 关闭时 checksum 为 0。
+- 每个缺口最多发送 2 次 NAK。
+- 两次 NAK 都未恢复时，Sub 不跳过缺口，不推进 `committed_offset` 或 `consumed_offset`，发送 RST 并从缺口起点或更早位置重新 SETUP；若 Pub 已无法恢复该位置，Sub 保持失败状态。
+- 缺口、丢包、CRC 错误和重传状态不通过 `UdpSubscriber` 对外暴露。
+
+## 13. 实施计划
+
+1. **协议层**：在 `core/udp/proto.h/.cpp` 定义固定 command、flags、基础头、各 command payload、显式网络字节序编解码、FNV-1a 和查表 CRC32；这一层不接触 socket。
+2. **system 纯 I/O 层**：在 `core/udp/engine/system/` 实现 `UdpSocket`、地址解析、组播加入、非阻塞收发和 epoll 事件封装；这一层不解析 command，不维护 Pub/Sub 状态。
+3. **UDP 公共抽象层**：在 `core/udp/` 提供 endpoint、packet、控制消息和传输错误的公共类型，隔离控制逻辑与 system 的具体实现。
+4. **SPSC 适配层**：在 `core/udp/udp_spsc_adapter.h` 增加适配类，实现按 offset 写入、连续提交和远端 `sub_pos` 更新；不修改 `core/ipc/spsc_channel.hpp`。
+5. **Pub 管理逻辑**：在 `core/udp/udp_pub.cpp` 实现应用 SPSC 输入、8 MiB retention ring、DATA 分片、组播/单播发送、SETUP/UPDATE/NAK 管理和按最慢 Sub 回收。
+6. **Sub 管理逻辑**：在 `core/udp/udp_sub.cpp` 实现双 socket、DATA 接收、按 offset 乱序写入、连续提交、NAK 两次重试、失败后 RST 和重连恢复。
+7. **验证**：完成 C++20 编译检查、协议单元测试、SPSC 适配测试、loopback 收发、丢包重传、重复包、组播/单播和 ring 回绕测试。
 
