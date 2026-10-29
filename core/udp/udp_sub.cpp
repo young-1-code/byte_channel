@@ -51,16 +51,39 @@ struct UdpSubscriber::Impl {
     std::vector<uint8_t> packet(65535); auto last_heartbeat = std::chrono::steady_clock::now();
     while (!stop.load(std::memory_order_acquire)) {
       btch::udp::system::UdpEvent event; events.wait(&event, 1, 1);
-      sockaddr_in source{}; const int length = data_socket.receive(packet.data(), packet.size(), &source);
-      if (length >= static_cast<int>(btch::udp::kHeaderLength)) HandleData(packet.data(), length);
-      sockaddr_in control_source{}; const int control_length = control_socket.receive(packet.data(), packet.size(), &control_source);
-      if (control_length >= static_cast<int>(btch::udp::kHeaderLength)) HandleControl(packet.data(), control_length, control_source);
+      // 一次事件循环批量清空内核队列，避免每轮只处理一个 DATA 包导致
+      // UDP 接收队列积压。控制包在每个批次前后各处理一次，保证 NAK/RST
+      // 不会被持续的数据流长期饿死。
+      for (int index = 0; index < 64; ++index) {
+        sockaddr_in control_source{};
+        const int control_length = control_socket.receive(packet.data(), packet.size(), &control_source);
+        if (control_length < 0) break;
+        if (control_length >= static_cast<int>(btch::udp::kHeaderLength)) {
+          HandleControl(packet.data(), control_length, control_source);
+        }
+      }
+      for (int index = 0; index < 256; ++index) {
+        sockaddr_in source{};
+        const int length = data_socket.receive(packet.data(), packet.size(), &source);
+        if (length < 0) break;
+        if (length >= static_cast<int>(btch::udp::kHeaderLength)) {
+          HandleData(packet.data(), length);
+        }
+      }
+      for (int index = 0; index < 64; ++index) {
+        sockaddr_in control_source{};
+        const int control_length = control_socket.receive(packet.data(), packet.size(), &control_source);
+        if (control_length < 0) break;
+        if (control_length >= static_cast<int>(btch::udp::kHeaderLength)) {
+          HandleControl(packet.data(), control_length, control_source);
+        }
+      }
       const auto now = std::chrono::steady_clock::now();
       if (!established && now >= next_setup) { SendSetup(); next_setup = now + std::chrono::milliseconds(200); }
       if (established && now >= next_heartbeat) { SendHeartbeat(); next_heartbeat = now + std::chrono::seconds(1); }
       if (commit_offset != last_update && (last_update == 0 || now - last_heartbeat > std::chrono::milliseconds(5))) { SendUpdate(); last_heartbeat = now; }
       if (!ranges.empty() && std::chrono::steady_clock::now() >= next_nak) SendNak();
-      if (length < 0 && control_length < 0) std::this_thread::sleep_for(std::chrono::microseconds(100));
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
   }
 
