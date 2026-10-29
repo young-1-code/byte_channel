@@ -53,8 +53,13 @@ class UdpSpscPublisher : public SpscPublisher {
     }
     auto& subscriber = head_->sub_item[0];
     const uint64_t released = channel_atomic::load(&subscriber.sub_pos);
+    const uint64_t write_length = static_cast<uint64_t>(length);
+    if (offset > UINT64_MAX - write_length ||
+        released > UINT64_MAX - head_->buffer_size) {
+      return channel_status::kWouldBlock;
+    }
     if (offset < released ||
-        offset + static_cast<uint64_t>(length) >
+        offset + write_length >
             released + head_->buffer_size) {
       return channel_status::kWouldBlock;
     }

@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <random>
 #include <sys/epoll.h>
@@ -64,14 +65,19 @@ struct UdpSubscriber::Impl {
   }
 
   void HandleData(const uint8_t* bytes, size_t length) {
-    btch::udp::Header h; if (!btch::udp::decode_header(bytes, length, h) || h.command != btch::udp::Command::kData || h.topic_id != btch::udp::topic_id(config.topic) || h.stream_id == 0 || (stream_id != 0 && h.stream_id != stream_id) || h.payload_length > length - btch::udp::kHeaderLength || h.data_offset + h.payload_length < h.data_offset) return;
+    btch::udp::Header h; if (!btch::udp::decode_header(bytes, length, h) || h.command != btch::udp::Command::kData || h.topic_id != btch::udp::topic_id(config.topic) || h.stream_id == 0 || h.payload_length == 0 || (stream_id != 0 && h.stream_id != stream_id) || h.payload_length > length - btch::udp::kHeaderLength || h.data_offset + h.payload_length < h.data_offset) return;
     if ((h.flags & btch::udp::kFlagCrc32) != 0) { std::vector<uint8_t> copy(bytes, bytes + length); const uint32_t expected = h.checksum; std::memset(copy.data() + 48, 0, 4); if (btch::udp::crc32(copy.data(), copy.size()) != expected) return; }
     if (!established) { if (pending_bytes + length <= 8u * 1024u * 1024u) { pending_data.emplace_back(bytes, bytes + length); pending_bytes += length; } return; }
     if (epoch != 0 && h.stream_epoch != epoch) return;
     if (epoch == 0) epoch = h.stream_epoch;
-    const int result = output.try_write_at(h.data_offset, reinterpret_cast<const char*>(bytes + btch::udp::kHeaderLength), static_cast<int>(h.payload_length));
+    const uint64_t packet_end = h.data_offset + h.payload_length;
+    if (packet_end <= commit_offset) return;
+    const uint64_t write_offset = std::max(h.data_offset, commit_offset);
+    const size_t skip = static_cast<size_t>(write_offset - h.data_offset);
+    const int write_length = static_cast<int>(packet_end - write_offset);
+    const int result = output.try_write_at(write_offset, reinterpret_cast<const char*>(bytes + btch::udp::kHeaderLength + skip), write_length);
     if (result != channel_status::kOk) return;
-    ranges[h.data_offset] = h.data_offset + h.payload_length; Advance();
+    RecordRange(write_offset, packet_end); Advance();
     if (!ranges.empty() && !nak_scheduled) { std::uniform_int_distribution<int> delay(50, 200); next_nak = std::chrono::steady_clock::now() + std::chrono::microseconds(delay(random)); nak_scheduled = true; }
   }
 
@@ -88,7 +94,25 @@ struct UdpSubscriber::Impl {
     for (const auto& data : pending) HandleData(data.data(), data.size());
   }
 
-  void Advance() { for (;;) { auto it = ranges.find(commit_offset); if (it == ranges.end()) break; commit_offset = it->second; ranges.erase(it); if (output.commit_until(commit_offset) != channel_status::kOk) break; } if (ranges.empty()) { nak_retries = 0; nak_scheduled = false; } }
+  void RecordRange(uint64_t start, uint64_t end) {
+    if (start >= end) return;
+    auto it = ranges.lower_bound(start);
+    if (it != ranges.begin()) {
+      auto previous = std::prev(it);
+      if (previous->second >= start) {
+        start = std::min(start, previous->first);
+        end = std::max(end, previous->second);
+        it = ranges.erase(previous);
+      }
+    }
+    while (it != ranges.end() && it->first <= end) {
+      end = std::max(end, it->second);
+      it = ranges.erase(it);
+    }
+    ranges.emplace(start, end);
+  }
+
+  void Advance() { for (;;) { auto it = ranges.begin(); if (it == ranges.end() || it->first > commit_offset) break; commit_offset = std::max(commit_offset, it->second); ranges.erase(it); if (output.commit_until(commit_offset) != channel_status::kOk) break; } if (ranges.empty()) { nak_retries = 0; nak_scheduled = false; } }
 
   void SendSetup() { btch::udp::SetupPayload setup; setup.sub_id = config.sub_id; setup.data_ipv4 = 0; setup.data_port = data_socket.local_port(); const bool resume = config.has_resume_offset || requested_resume != 0; setup.resume_offset = requested_resume != 0 ? requested_resume : config.resume_offset; std::vector<uint8_t> body(resume ? 20 : 12), packet(btch::udp::kHeaderLength + body.size()); btch::udp::encode_setup(setup, resume, body.data(), body.size()); btch::udp::Header h; h.command = btch::udp::Command::kSetup; h.flags = resume ? btch::udp::kFlagHasResume : 0; h.topic_id = btch::udp::topic_id(config.topic); h.stream_id = 0; h.sub_id = config.sub_id; h.payload_length = body.size(); btch::udp::encode_header(h, packet.data(), packet.size()); std::memcpy(packet.data() + btch::udp::kHeaderLength, body.data(), body.size()); control_socket.send_to(publisher, packet.data(), packet.size()); }
 

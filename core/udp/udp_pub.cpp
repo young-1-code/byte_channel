@@ -80,12 +80,12 @@ struct UdpPublisher::Impl {
 
   void Setup(const btch::udp::Header& h, const uint8_t* body, const sockaddr_in& peer) {
     btch::udp::SetupPayload setup; const bool resume = (h.flags & btch::udp::kFlagHasResume) != 0;
-    if (!btch::udp::decode_setup(body, h.payload_length, resume, setup)) return;
+    if (!btch::udp::decode_setup(body, h.payload_length, resume, setup) ||
+        h.sub_id != setup.sub_id) return;
     const bool resume_invalid = setup.resume_offset > offset || (retention.empty() ? setup.resume_offset != offset : setup.resume_offset < retention.front().offset);
     if (resume && resume_invalid) { SendRst(peer, setup.sub_id); return; }
-    auto existing = subscribers.find(setup.sub_id);
-    const bool reconnect = existing != subscribers.end() && existing->second.active == false;
-    if (reconnect) { epoch = epoch == UINT32_MAX ? 1 : epoch + 1; sequence = 0; }
+    // stream_epoch 属于整个 Pub 流，而不是单个 Sub。单个订阅者重连时
+    // 只恢复自己的消费位置，不能让其他活跃订阅者看到新的 epoch。
     auto& sub = subscribers[setup.sub_id]; sub.control_peer = peer; sub.active = true; sub.last_update = std::chrono::steady_clock::now(); sub.consumed = resume ? setup.resume_offset : offset;
     if (setup.data_port) { sub.data_peer.sin_family = AF_INET; sub.data_peer.sin_port = htons(setup.data_port); sub.data_peer.sin_addr.s_addr = setup.data_ipv4 ? setup.data_ipv4 : peer.sin_addr.s_addr; }
     btch::udp::EstablishPayload establish{setup.sub_id, sub.consumed}; std::vector<uint8_t> body_out(12), packet(btch::udp::kHeaderLength + 12);
@@ -94,11 +94,11 @@ struct UdpPublisher::Impl {
     for (const auto& saved : retention) if (saved.offset + saved.payload.size() > sub.consumed) Send(saved, replay_destination, true);
   }
 
-  void Update(const btch::udp::Header& header, const uint8_t* body, size_t length, const sockaddr_in& peer) { btch::udp::UpdatePayload update; if (header.stream_epoch != epoch || !btch::udp::decode_update(body, length, update)) return; auto it = subscribers.find(update.sub_id); if (it == subscribers.end() || !it->second.active || it->second.control_peer.sin_addr.s_addr != peer.sin_addr.s_addr || it->second.control_peer.sin_port != peer.sin_port || update.consumed_offset < it->second.consumed || update.consumed_offset > offset) return; it->second.last_update = std::chrono::steady_clock::now(); it->second.consumed = update.consumed_offset; Reclaim(); }
+  void Update(const btch::udp::Header& header, const uint8_t* body, size_t length, const sockaddr_in& peer) { btch::udp::UpdatePayload update; if (header.stream_epoch != epoch || !btch::udp::decode_update(body, length, update) || header.sub_id != update.sub_id) return; auto it = subscribers.find(update.sub_id); if (it == subscribers.end() || !it->second.active || it->second.control_peer.sin_addr.s_addr != peer.sin_addr.s_addr || it->second.control_peer.sin_port != peer.sin_port || update.consumed_offset < it->second.consumed || update.consumed_offset > offset) return; it->second.last_update = std::chrono::steady_clock::now(); it->second.consumed = update.consumed_offset; Reclaim(); }
 
   void Heartbeat(const btch::udp::Header& header, const sockaddr_in& peer) { auto it = subscribers.find(header.sub_id); if (header.stream_epoch != epoch || it == subscribers.end() || !it->second.active || it->second.control_peer.sin_addr.s_addr != peer.sin_addr.s_addr || it->second.control_peer.sin_port != peer.sin_port) return; it->second.last_update = std::chrono::steady_clock::now(); btch::udp::Header response; response.command = btch::udp::Command::kHeartbeat; response.topic_id = btch::udp::topic_id(config.topic); response.stream_id = stream_id; response.stream_epoch = epoch; response.sub_id = header.sub_id; std::array<uint8_t, btch::udp::kHeaderLength> wire{}; btch::udp::encode_header(response, wire.data(), wire.size()); control_socket.send_to(peer, wire.data(), wire.size()); }
 
-  void Nak(const btch::udp::Header& h, const uint8_t* body, const sockaddr_in& peer) { btch::udp::NakPayload nak; if (h.stream_epoch != epoch || !btch::udp::decode_nak(body, h.payload_length, nak)) return; auto it = subscribers.find(nak.sub_id); if (it == subscribers.end() || !it->second.active || it->second.control_peer.sin_addr.s_addr != peer.sin_addr.s_addr || it->second.control_peer.sin_port != peer.sin_port) return; const sockaddr_in& destination = config.data_mode == UdpDataMode::kMulticast ? data_destination : it->second.data_peer; for (size_t i = 0; i < nak.range_count; ++i) { const auto& range = nak.ranges[i]; if (range.length == 0 || range.start_offset > UINT64_MAX - range.length) continue; const uint64_t requested_end = range.start_offset + range.length; for (const auto& packet : retention) if (packet.offset < requested_end && packet.offset + packet.payload.size() > range.start_offset) Send(packet, destination, true); } }
+  void Nak(const btch::udp::Header& h, const uint8_t* body, const sockaddr_in& peer) { btch::udp::NakPayload nak; if (h.stream_epoch != epoch || !btch::udp::decode_nak(body, h.payload_length, nak) || h.sub_id != nak.sub_id) return; auto it = subscribers.find(nak.sub_id); if (it == subscribers.end() || !it->second.active || it->second.control_peer.sin_addr.s_addr != peer.sin_addr.s_addr || it->second.control_peer.sin_port != peer.sin_port) return; const sockaddr_in& destination = config.data_mode == UdpDataMode::kMulticast ? data_destination : it->second.data_peer; for (size_t i = 0; i < nak.range_count; ++i) { const auto& range = nak.ranges[i]; if (range.length == 0 || range.start_offset > UINT64_MAX - range.length) continue; const uint64_t requested_end = range.start_offset + range.length; for (const auto& packet : retention) if (packet.offset < requested_end && packet.offset + packet.payload.size() > range.start_offset) Send(packet, destination, true); } }
 
   void Publish(const uint8_t* data, size_t length) {
     Packet packet{offset, sequence++, std::vector<uint8_t>(data, data + length)}; retention.push_back(packet); offset += length; retained_bytes.fetch_add(length, std::memory_order_release);

@@ -429,7 +429,7 @@ control_socket
 - `topic_id` 使用固定 FNV-1a 32-bit。
 - `sub_id` 为调用方传入的稳定 `uint32_t`，在同一 Pub 流内唯一；相同 `sub_id` 的新 SETUP 视为重连并替换旧 endpoint。
 - `stream_id` 在 Pub `create()` 时生成随机非零 `uint32_t`，生命周期内保持不变。
-- `stream_epoch` 初始值为 1；每次重置或重新建立流时递增，溢出时跳过 0。
+- `stream_epoch` 初始值为 1，属于整个 Pub 流；单个 Sub 重连只恢复自己的 offset，不递增全局 epoch，避免影响其他活跃 Sub。只有 Pub 流整体重置时才递增，溢出时跳过 0。
 - `packet_seq` 在每个 epoch 内从 0 开始递增。
 - 首次 SETUP 不携带恢复位置，ESTABLISH 返回 Pub 当前最新发布位置。
 - 重连 SETUP 可以携带 `resume_offset`；Pub 校验可恢复范围，失效时发送 RST。
