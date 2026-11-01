@@ -17,21 +17,21 @@ struct UdpSocketConfig {
 };
 
 class UdpSocket {
- public:
+public:
   UdpSocket() = default;
   ~UdpSocket();
-  UdpSocket(const UdpSocket&) = delete;
-  UdpSocket& operator=(const UdpSocket&) = delete;
+  UdpSocket(const UdpSocket &) = delete;
+  UdpSocket &operator=(const UdpSocket &) = delete;
 
-  int open(const UdpSocketConfig& config);
+  int open(const UdpSocketConfig &config);
   int close();
   int fd() const { return fd_; }
   uint16_t local_port() const;
-  int send_to(const sockaddr_in& peer, const void* data, size_t length) const;
-  int receive(void* data, size_t capacity, sockaddr_in* peer) const;
+  int send_to(const sockaddr_in &peer, const void *data, size_t length) const;
+  int receive(void *data, size_t capacity, sockaddr_in *peer) const;
 
- private:
+private:
   int fd_ = -1;
 };
 
-}  // namespace btch::udp::system
+} // namespace btch::udp::system

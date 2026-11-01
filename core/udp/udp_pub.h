@@ -24,19 +24,19 @@ struct UdpPubConfig {
 };
 
 class UdpPublisher {
- private:
+private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 
- public:
+public:
   UdpPublisher();
   ~UdpPublisher();
 
-  UdpPublisher(const UdpPublisher&) = delete;
-  UdpPublisher& operator=(const UdpPublisher&) = delete;
+  UdpPublisher(const UdpPublisher &) = delete;
+  UdpPublisher &operator=(const UdpPublisher &) = delete;
 
-  int create(const UdpPubConfig& config);
-  int try_push(const char* data, int length);
+  int create(const UdpPubConfig &config);
+  int try_push(const char *data, int length);
   int get_available_publish_len() const;
   int close();
 };

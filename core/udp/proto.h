@@ -79,21 +79,21 @@ struct NakPayload {
 };
 
 uint32_t topic_id(std::string_view topic);
-uint32_t crc32(const uint8_t* data, size_t length);
-size_t encode_header(const Header& header, uint8_t* output, size_t capacity);
-bool decode_header(const uint8_t* data, size_t length, Header& header);
-size_t encode_setup(const SetupPayload& payload, bool has_resume, uint8_t* output,
-                    size_t capacity);
-bool decode_setup(const uint8_t* data, size_t length, bool has_resume,
-                  SetupPayload& payload);
-size_t encode_establish(const EstablishPayload& payload, uint8_t* output,
+uint32_t crc32(const uint8_t *data, size_t length);
+size_t encode_header(const Header &header, uint8_t *output, size_t capacity);
+bool decode_header(const uint8_t *data, size_t length, Header &header);
+size_t encode_setup(const SetupPayload &payload, bool has_resume,
+                    uint8_t *output, size_t capacity);
+bool decode_setup(const uint8_t *data, size_t length, bool has_resume,
+                  SetupPayload &payload);
+size_t encode_establish(const EstablishPayload &payload, uint8_t *output,
                         size_t capacity);
-bool decode_establish(const uint8_t* data, size_t length,
-                      EstablishPayload& payload);
-size_t encode_update(const UpdatePayload& payload, uint8_t* output,
+bool decode_establish(const uint8_t *data, size_t length,
+                      EstablishPayload &payload);
+size_t encode_update(const UpdatePayload &payload, uint8_t *output,
                      size_t capacity);
-bool decode_update(const uint8_t* data, size_t length, UpdatePayload& payload);
-size_t encode_nak(const NakPayload& payload, uint8_t* output, size_t capacity);
-bool decode_nak(const uint8_t* data, size_t length, NakPayload& payload);
+bool decode_update(const uint8_t *data, size_t length, UpdatePayload &payload);
+size_t encode_nak(const NakPayload &payload, uint8_t *output, size_t capacity);
+bool decode_nak(const uint8_t *data, size_t length, NakPayload &payload);
 
-}  // namespace btch::udp
+} // namespace btch::udp

@@ -23,21 +23,21 @@ struct UdpSubConfig {
 };
 
 class UdpSubscriber {
- private:
+private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 
- public:
+public:
   UdpSubscriber();
   ~UdpSubscriber();
 
-  UdpSubscriber(const UdpSubscriber&) = delete;
-  UdpSubscriber& operator=(const UdpSubscriber&) = delete;
+  UdpSubscriber(const UdpSubscriber &) = delete;
+  UdpSubscriber &operator=(const UdpSubscriber &) = delete;
 
-  int subscribe(const UdpSubConfig& config);
-  int try_pop(char* data, int length);
+  int subscribe(const UdpSubConfig &config);
+  int try_pop(char *data, int length);
   int enable_pop_lock_mode(int max_length);
-  const char* try_pop_lock(int length);
+  const char *try_pop_lock(int length);
   int pop_unlock();
   int unsubscribe();
 };
