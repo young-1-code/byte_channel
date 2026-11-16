@@ -7,7 +7,7 @@ header-only 的 C++17 字节流通道库。基于无锁环形缓冲区提供线�
 - **两种通道模型**
   - 通用通道（`Pulisher` / `Subscriber`）：单生产者多消费者，最多 32 个订阅者。内置后台线程跟踪最慢订阅者位置、判活（10 秒超时）并自动剔除失联订阅者
   - SPSC 通道（`SpscPublisher` / `SpscSubscriber`）：单生产者单消费者，无后台线程、不做订阅者扫描，开销更低
-- **两种内存模式**：`MemoryType::Thread`（进程内堆内存）与 `MemoryType::Shared`（`/dev/shm` 文件 + `mmap(MAP_SHARED)` 跨进程共享内存，按 topic 定位）
+- **两种内存模式**：`MemoryType::Thread`（进程内堆内存）与 `MemoryType::Shared`（普通文件 + `mmap(MAP_SHARED)` 跨进程共享内存，按 topic 定位）
 - **无锁实现**：使用 GCC/Clang `__atomic` 内建函数直接操作共享内存中的定宽整数，编译期 `static_assert` 保证无锁
 - **两种消费模式**：`try_pop` 拷贝读取；pop-lock 零拷贝读取（`try_pop_lock` 直接返回环形缓冲区内部指针，跨环数据自动整理到内部缓冲区）
 - **非阻塞接口**：所有 `try_*` 调用不阻塞，空间 / 数据不足通过返回码通知调用方重试
@@ -126,7 +126,9 @@ while (running) {
 - `try_pop` 与 pop-lock 模式不能混用，存在未 `pop_unlock` 的读取时其他读取调用会失败
 - 通用通道生产者后台线程会剔除"阻塞生产且 10 秒无心跳"的订阅者；SPSC 通道不做判活，由调用方保证恰好一个消费者
 - 订阅者只消费订阅之后发布的数据，进程重启后需重新订阅
-- 仅支持 Linux；共享内存路径默认前缀 `/dev/shm/btchanel/`
+- 共享内存路径默认前缀 `/dev/shm/btchanel/`；可通过环境变量
+  `LUMIN_SHARED_MEMORY_PREFIX` 指定其他绝对路径（例如 macOS 的
+  `/tmp/lumin_trade_shared`）。所有生产者和订阅者必须使用相同前缀。
 
 ## 压测
 

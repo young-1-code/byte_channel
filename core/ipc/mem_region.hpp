@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fcntl.h>
 #include <limits>
 #include <new>
@@ -16,6 +17,17 @@
 #include "channel_comm.h"
 
 inline constexpr const char *DEFAULT_SHARED_MEMORY_PREFIX = "/dev/shm/btchanel";
+
+// Shared IPC normally uses /dev/shm on Linux. Some platforms (including
+// macOS) do not provide that mount, but regular files still support the
+// MAP_SHARED contract used by this library. Keep the default for existing
+// deployments and allow process launchers to select a writable absolute path.
+inline std::string shared_memory_prefix() {
+  const char *configured = ::getenv("LUMIN_SHARED_MEMORY_PREFIX");
+  if (configured != nullptr && configured[0] != '\0')
+    return std::string(configured);
+  return std::string(DEFAULT_SHARED_MEMORY_PREFIX);
+}
 
 // 内存区域类型。Thread 使用进程内堆内存，Shared 使用文件映射内存。
 enum class MemoryType : uint8_t { Thread, Shared };
@@ -135,7 +147,7 @@ public:
   // 创建共享文件并映射到当前进程。
   // 返回 kAlreadyExists 表示 topic 已经存在，调用方应改用 open_shared。
   int create_shared(const std::string &topic, size_t size,
-                    const std::string &prefix = DEFAULT_SHARED_MEMORY_PREFIX,
+                    const std::string &prefix = shared_memory_prefix(),
                     mode_t mode = 0660) {
     std::string path = make_shared_path(topic, prefix);
     if (path.empty() || size == 0 || m_address != nullptr ||
@@ -173,7 +185,7 @@ public:
 
   // 打开已经存在的共享文件并映射到当前进程。
   int open_shared(const std::string &topic,
-                  const std::string &prefix = DEFAULT_SHARED_MEMORY_PREFIX) {
+                  const std::string &prefix = shared_memory_prefix()) {
     std::string path = make_shared_path(topic, prefix);
     if (path.empty() || m_address != nullptr) {
       return channel_status::kInvalidArgument;
