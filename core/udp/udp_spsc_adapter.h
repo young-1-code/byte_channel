@@ -28,16 +28,16 @@ public:
   int create(int buffer_size, const std::string &name, const MemoryType &type) {
     int result = SpscPublisher::create(buffer_size, name, type);
     if (result == channel_status::kOk) {
-      all_ = static_cast<uint8_t *>(shared_memory());
+      all_ = static_cast<uint8_t *>(shared_memory().metadata);
       head_ = reinterpret_cast<IPCHeadInfo *>(all_);
-      buffer_ = all_ + sizeof(IPCHeadInfo);
+      buffer_ = static_cast<uint8_t *>(shared_memory().data);
       reserve_end_ = 0;
     }
     return result;
   }
 
   int available_write_len() const {
-    uint8_t *all = static_cast<uint8_t *>(shared_memory());
+    uint8_t *all = static_cast<uint8_t *>(shared_memory().metadata);
     if (all == nullptr)
       return 0;
     const IPCHeadInfo *head = reinterpret_cast<const IPCHeadInfo *>(all);
@@ -104,13 +104,13 @@ private:
   std::vector<uint8_t> lock_buffer_;
 
 public:
-  int subscribe(void *shared_memory) {
-    int result = SpscSubscriber::subscribe(shared_memory);
+  int subscribe(const SharedMemoryView &view) {
+    int result = SpscSubscriber::subscribe(view);
     if (result == channel_status::kOk) {
-      all_ = static_cast<uint8_t *>(shared_memory);
+      all_ = static_cast<uint8_t *>(view.metadata);
       IPCHeadInfo *head = reinterpret_cast<IPCHeadInfo *>(all_);
       read_pos_ = channel_atomic::load(&head->pub_pos);
-      buffer_ = all_ + sizeof(IPCHeadInfo);
+      buffer_ = static_cast<uint8_t *>(view.data);
       buffer_size_ = head->buffer_size;
     }
     return result;

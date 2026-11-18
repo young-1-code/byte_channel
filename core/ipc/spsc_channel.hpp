@@ -41,21 +41,29 @@ public:
     // mem head 与数据区连续分配，保持和普通 channel 的布局兼容。
     size_t actual_size = static_cast<size_t>(buffer_size) + sizeof(IPCHeadInfo);
     int result = type == MemoryType::Thread
-                     ? m_memory.create_thread(actual_size)
+                     ? m_memory.create_thread_split(
+                           static_cast<size_t>(buffer_size),
+                           sizeof(IPCHeadInfo))
                  : type == MemoryType::Shared
-                     ? m_memory.create_shared(topic_name, actual_size)
+                     ? m_memory.create_shared_split(topic_name,
+                                                    static_cast<size_t>(buffer_size))
                      : channel_status::kInvalidArgument;
     if (result != channel_status::kOk)
       return result;
 
-    p_all_buffer = static_cast<uint8_t *>(m_memory.data());
+    p_all_buffer = static_cast<uint8_t *>(m_memory.metadata());
     p_head = reinterpret_cast<IPCHeadInfo *>(p_all_buffer);
-    p_buffer = p_all_buffer + sizeof(IPCHeadInfo);
+    p_buffer = static_cast<uint8_t *>(m_memory.data());
 
     channel_atomic::store(&p_head->pub_pos, uint64_t{0});
     channel_atomic::store(&p_head->active_sub_num, uint64_t{0});
     channel_atomic::store(&p_head->curr_ts, get_ns_monotonic());
     p_head->buffer_size = static_cast<uint64_t>(buffer_size);
+    p_head->data_offset = 0;
+    p_head->data_size = static_cast<uint64_t>(buffer_size);
+    p_head->mapped_size = static_cast<uint64_t>(m_memory.data_size());
+    p_head->page_mode = 0;
+    p_head->page_size = 4096;
     p_head->magic_num = MAGIC_HEAD_NUM;
     p_head->version = IPC_HEAD_VERSION;
     p_head->header_size = sizeof(IPCHeadInfo);
@@ -70,6 +78,7 @@ public:
       channel_atomic::store(&item.is_active, uint8_t{0}, __ATOMIC_RELAXED);
       item.reverse[0] = '\0';
     }
+    __atomic_store_n(&p_head->init_state, uint32_t{1}, __ATOMIC_RELEASE);
 
     m_buffer_size = buffer_size;
     m_mask = buffer_size - 1;
@@ -114,7 +123,7 @@ public:
     return channel_status::kOk;
   }
 
-  void *shared_memory() const { return p_all_buffer; }
+  SharedMemoryView shared_memory() const { return m_memory.view(); }
   size_t shared_memory_size() const {
     return sizeof(IPCHeadInfo) + static_cast<size_t>(m_buffer_size);
   }
@@ -136,17 +145,25 @@ private:
   int m_single_max_size = 0;
   int m_last_read_size_lock = 0;
 
-  int attach(void *shared_memory) {
-    if (shared_memory == nullptr || item != nullptr) {
+  int attach(const SharedMemoryView &view) {
+    if (view.metadata == nullptr || view.data == nullptr || item != nullptr) {
       return channel_status::kInvalidArgument;
     }
 
-    p_all_buffer = static_cast<uint8_t *>(shared_memory);
+    p_all_buffer = static_cast<uint8_t *>(view.metadata);
     p_head = reinterpret_cast<IPCHeadInfo *>(p_all_buffer);
+    for (int attempt = 0; attempt < 1000 &&
+         __atomic_load_n(&p_head->init_state, __ATOMIC_ACQUIRE) != 1;
+         ++attempt)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (p_head->magic_num != MAGIC_HEAD_NUM ||
         p_head->version != IPC_HEAD_VERSION ||
         p_head->header_size != sizeof(IPCHeadInfo) ||
+        p_head->init_state != 1 ||
         p_head->buffer_size == 0 ||
+        p_head->data_offset != 0 ||
+        p_head->data_size != p_head->buffer_size ||
+        p_head->mapped_size < p_head->buffer_size ||
         p_head->buffer_size >
             static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
         (p_head->buffer_size & (p_head->buffer_size - 1)) != 0) {
@@ -156,7 +173,7 @@ private:
 
     // SPSC 不计算 is_active，调用方负责保证只有一个消费者连接。
     SubcribeItem *candidate = &p_head->sub_item[0];
-    p_buffer = p_all_buffer + sizeof(IPCHeadInfo);
+    p_buffer = static_cast<uint8_t *>(view.data);
     m_buffer_size = static_cast<int>(p_head->buffer_size);
     m_mask = m_buffer_size - 1;
     m_rpos = channel_atomic::load(&p_head->pub_pos);
@@ -184,16 +201,16 @@ public:
   ~SpscSubscriber() { unsubscribe(); }
 
   int subscribe(const std::string &topic_name) {
-    int result = m_memory.open_shared(topic_name);
+    int result = m_memory.open_shared_split(topic_name);
     if (result != 0)
       return result;
-    result = attach(m_memory.data());
+    result = attach(m_memory.view());
     if (result != 0)
       m_memory = MemoryRegion{};
     return result;
   }
 
-  int subscribe(void *shared_memory) { return attach(shared_memory); }
+  int subscribe(const SharedMemoryView &view) { return attach(view); }
 
   int unsubscribe() {
     if (m_single_max_buffer) {

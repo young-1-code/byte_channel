@@ -34,6 +34,13 @@ struct alignas(CACHE_LINE_SIZE) IPCHeadInfo {
   uint32_t version;
   uint32_t header_size;
   uint64_t buffer_size; //存放数据的缓冲区大小
+  uint64_t data_offset;
+  uint64_t data_size;
+  uint64_t mapped_size;
+  uint32_t page_mode;
+  uint32_t page_size;
+  uint32_t init_state;
+  uint32_t metadata_checksum;
   uint64_t curr_ts; //计算是否 active，超过 10 秒判断 producer 关闭
   char topic_name[48];                              //订阅topic名字
   alignas(CACHE_LINE_SIZE) uint64_t active_sub_num; //活跃的订阅者数量
@@ -81,25 +88,31 @@ public:
 
     int actual_szie = buffer_size + sizeof(IPCHeadInfo);
     if (type == MemoryType::Thread) {
-      int result = m_memory.create_thread(static_cast<size_t>(actual_szie));
+      int result = m_memory.create_thread_split(
+          static_cast<size_t>(buffer_size), sizeof(IPCHeadInfo));
       if (result != channel_status::kOk)
         return result;
     } else if (type == MemoryType::Shared) {
-      int result =
-          m_memory.create_shared(topic_name, static_cast<size_t>(actual_szie));
+      int result = m_memory.create_shared_split(
+          topic_name, static_cast<size_t>(buffer_size));
       if (result != channel_status::kOk)
         return result;
     } else {
       // 非法参数
       return channel_status::kInvalidArgument;
     }
-    p_all_buffer = static_cast<uint8_t *>(m_memory.data());
+    p_all_buffer = static_cast<uint8_t *>(m_memory.metadata());
 
     p_head = (IPCHeadInfo *)p_all_buffer;
     channel_atomic::store(&p_head->pub_pos, uint64_t{0});
     channel_atomic::store(&p_head->active_sub_num, uint64_t{0});
     channel_atomic::store(&p_head->curr_ts, get_ns_monotonic());
     p_head->buffer_size = buffer_size;
+    p_head->data_offset = 0;
+    p_head->data_size = static_cast<uint64_t>(buffer_size);
+    p_head->mapped_size = static_cast<uint64_t>(m_memory.data_size());
+    p_head->page_mode = 0;
+    p_head->page_size = 4096;
     p_head->magic_num = MAGIC_HEAD_NUM;
     p_head->version = IPC_HEAD_VERSION;
     p_head->header_size = sizeof(IPCHeadInfo);
@@ -112,6 +125,7 @@ public:
       channel_atomic::store(&item.is_active, uint8_t{0}, __ATOMIC_RELAXED);
       item.reverse[0] = '\0';
     }
+    __atomic_store_n(&p_head->init_state, uint32_t{1}, __ATOMIC_RELEASE);
 
     //对象中变量
     min_sub_pos.store(0, std::memory_order_release);
@@ -119,7 +133,7 @@ public:
     m_mask = buffer_size - 1;
     m_wpos = 0;
     m_rpos = 0;
-    p_buffer = p_all_buffer + sizeof(IPCHeadInfo);
+    p_buffer = static_cast<uint8_t *>(m_memory.data());
     m_created = true;
 
     _th = std::thread([this]() {
@@ -245,9 +259,9 @@ public:
     return static_cast<int>(m_buffer_size - occupied);
   }
 
-  void *shared_memory() const { return p_all_buffer; }
+  SharedMemoryView shared_memory() const { return m_memory.view(); }
   size_t shared_memory_size() const {
-    return sizeof(IPCHeadInfo) + m_buffer_size;
+    return m_memory.data_size();
   }
 };
 
@@ -275,10 +289,10 @@ public:
 
   // 进程间订阅，共享内存
   int subscribe(const std::string &topic_name) {
-    int result = m_memory.open_shared(topic_name);
+    int result = m_memory.open_shared_split(topic_name);
     if (result != channel_status::kOk)
       return result;
-    result = subscribe(m_memory.data());
+    result = subscribe(m_memory.view());
     if (result != channel_status::kOk) {
       // attach 失败时也要释放已经建立的 mmap，保证对象可以重试订阅。
       m_memory = MemoryRegion{};
@@ -287,18 +301,26 @@ public:
   }
 
   // 进程内订阅
-  int subscribe(void *shared_memory) {
+  int subscribe(const SharedMemoryView &view) {
     if (item != nullptr)
       return channel_status::kInvalidArgument;
-    if (shared_memory == nullptr)
+    if (view.metadata == nullptr || view.data == nullptr)
       return channel_status::kInvalidArgument;
 
-    p_all_buffer = static_cast<uint8_t *>(shared_memory);
+    p_all_buffer = static_cast<uint8_t *>(view.metadata);
     p_head = reinterpret_cast<IPCHeadInfo *>(p_all_buffer);
+    for (int attempt = 0; attempt < 1000 &&
+         __atomic_load_n(&p_head->init_state, __ATOMIC_ACQUIRE) != 1;
+         ++attempt)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (p_head->magic_num != MAGIC_HEAD_NUM ||
         p_head->version != IPC_HEAD_VERSION ||
         p_head->header_size != sizeof(IPCHeadInfo) ||
+        p_head->init_state != 1 ||
         p_head->buffer_size == 0 ||
+        p_head->data_offset != 0 ||
+        p_head->data_size != p_head->buffer_size ||
+        p_head->mapped_size < p_head->buffer_size ||
         p_head->buffer_size >
             static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
         (p_head->buffer_size & (p_head->buffer_size - 1)) != 0) {
@@ -307,7 +329,7 @@ public:
       return channel_status::kInvalidArgument;
     }
 
-    p_buffer = p_all_buffer + sizeof(IPCHeadInfo);
+    p_buffer = static_cast<uint8_t *>(view.data);
     m_buffer_size = static_cast<int>(p_head->buffer_size);
     m_mask = m_buffer_size - 1;
     uint64_t position = channel_atomic::load(&p_head->pub_pos);
