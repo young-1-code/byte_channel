@@ -179,6 +179,10 @@ public:
   }
 
   int try_push(const char *p_data, int len) {
+    if (!m_created || p_head == nullptr) {
+      return channel_status::kNotInitialized;
+    }
+
     // 参数校验
     if (len > m_buffer_size || p_data == nullptr || len < 1) {
       return channel_status::kInvalidArgument;
@@ -228,6 +232,11 @@ public:
   }
 
   int get_avialbe_publish_len() const {
+    // 该接口返回可写字节数而不是状态码；未初始化时按无可用空间处理，
+    // 同时避免解引用空的共享内存头部。
+    if (!m_created || p_head == nullptr) {
+      return 0;
+    }
     uint64_t pub_pos = channel_atomic::load(&p_head->pub_pos);
     uint64_t min_pos = min_sub_pos.load(std::memory_order_acquire);
     uint64_t occupied = pub_pos - min_pos;
@@ -269,7 +278,12 @@ public:
     int result = m_memory.open_shared(topic_name);
     if (result != channel_status::kOk)
       return result;
-    return subscribe(m_memory.data());
+    result = subscribe(m_memory.data());
+    if (result != channel_status::kOk) {
+      // attach 失败时也要释放已经建立的 mmap，保证对象可以重试订阅。
+      m_memory = MemoryRegion{};
+    }
+    return result;
   }
 
   // 进程内订阅
@@ -340,6 +354,9 @@ public:
     m_mask = 0;
     m_wpos = 0;
     m_rpos = 0;
+    // Thread 模式下这里是空对象；Shared 模式下释放 mmap/fd，允许同一
+    // Subscriber 对象再次订阅同一个 topic。
+    m_memory = MemoryRegion{};
     return channel_status::kOk;
   }
 

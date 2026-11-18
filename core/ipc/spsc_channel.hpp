@@ -201,6 +201,9 @@ public:
       m_single_max_size = 0;
     }
     reset();
+    // Shared 模式的订阅由 m_memory 持有 mmap/fd；退订后必须释放它，
+    // 否则同一个对象无法再次 open_shared。
+    m_memory = MemoryRegion{};
     return channel_status::kOk;
   }
 
