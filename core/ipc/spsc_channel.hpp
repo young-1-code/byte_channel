@@ -38,8 +38,7 @@ public:
       return channel_status::kInvalidArgument;
     }
 
-    // mem head 与数据区连续分配，保持和普通 channel 的布局兼容。
-    size_t actual_size = static_cast<size_t>(buffer_size) + sizeof(IPCHeadInfo);
+    // metadata 和 data 分开映射；两者仍由同一个 MemoryRegion 管理。
     int result = type == MemoryType::Thread
                      ? m_memory.create_thread_split(
                            static_cast<size_t>(buffer_size),

@@ -7,7 +7,7 @@ header-only 的 C++17 字节流通道库。基于无锁环形缓冲区提供线�
 - **两种通道模型**
   - 通用通道（`Pulisher` / `Subscriber`）：单生产者多消费者，最多 32 个订阅者。内置后台线程跟踪最慢订阅者位置、判活（10 秒超时）并自动剔除失联订阅者
   - SPSC 通道（`SpscPublisher` / `SpscSubscriber`）：单生产者单消费者，无后台线程、不做订阅者扫描，开销更低
-- **两种内存模式**：`MemoryType::Thread`（进程内堆内存）与 `MemoryType::Shared`（普通文件 + `mmap(MAP_SHARED)` 跨进程共享内存，按 topic 定位）
+- **两种内存模式**：`MemoryType::Thread`（进程内内存）与 `MemoryType::Shared`（普通文件 + `mmap(MAP_SHARED)` 跨进程共享内存，按 topic 定位）。共享通道使用同一文件的双映射：ring data 从 offset 0 开始，metadata 位于文件尾部；进程间只传递文件 offset/长度，不传递裸指针
 - **无锁实现**：使用 GCC/Clang `__atomic` 内建函数直接操作共享内存中的定宽整数，编译期 `static_assert` 保证无锁
 - **两种消费模式**：`try_pop` 拷贝读取；pop-lock 零拷贝读取（`try_pop_lock` 直接返回环形缓冲区内部指针，跨环数据自动整理到内部缓冲区）
 - **非阻塞接口**：所有 `try_*` 调用不阻塞，空间 / 数据不足通过返回码通知调用方重试
@@ -39,7 +39,8 @@ Pulisher publisher;
 publisher.create(1 << 16, "md_feed", MemoryType::Thread);  // 容量必须是 2 的幂
 
 Subscriber subscriber;
-subscriber.subscribe(publisher.shared_memory());          // 进程内直接传内存指针
+SharedMemoryView view = publisher.shared_memory();
+subscriber.subscribe(view);                               // metadata/data 两个映射
 
 const char msg[] = "hello channel";
 publisher.try_push(msg, sizeof(msg));
@@ -57,7 +58,8 @@ SpscPublisher publisher;
 publisher.create(1 << 20, "tick", MemoryType::Thread);
 
 SpscSubscriber subscriber;
-subscriber.subscribe(publisher.shared_memory());
+SharedMemoryView view = publisher.shared_memory();
+subscriber.subscribe(view);
 ```
 
 ### 进程间通信（共享内存）
@@ -93,14 +95,14 @@ while (running) {
 | --- | --- |
 | `create(buffer_size, topic, type)` | 创建通道，`buffer_size` 必须为 2 的幂 |
 | `try_push(data, len)` | 非阻塞写入 |
-| `shared_memory()` | 返回底层内存指针，供进程内订阅使用 |
+| `shared_memory()` | 返回 `SharedMemoryView`，包含 metadata/data 两个映射 |
 | `get_avialbe_publish_len()`（仅通用通道） | 当前可写字节数 |
 
 消费者（`Subscriber` / `SpscSubscriber`）：
 
 | 接口 | 说明 |
 | --- | --- |
-| `subscribe(topic)` / `subscribe(ptr)` | 订阅；从订阅时刻的发布位置开始消费，不回放历史数据 |
+| `subscribe(topic)` / `subscribe(view)` | 订阅；从订阅时刻的发布位置开始消费，不回放历史数据 |
 | `try_pop(data, len)` | 拷贝读取 |
 | `enable_pop_lock_mode(max)` | 开启 pop-lock 模式并设定单块上限 |
 | `try_pop_lock(len)` / `pop_unlock()` | 零拷贝读取 / 提交消费位置 |
@@ -129,6 +131,7 @@ while (running) {
 - 共享内存路径默认前缀 `/dev/shm/btchanel/`；可通过环境变量
   `LUMIN_SHARED_MEMORY_PREFIX` 指定其他绝对路径（例如 macOS 的
   `/tmp/lumin_trade_shared`）。所有生产者和订阅者必须使用相同前缀。
+- Shared 模式创建 data 区按 2 MiB 向上取整，调用 `MADV_HUGEPAGE` 并在创建阶段预触碰数据页；metadata 固定为 4 KiB。大页是优化提示，是否实际合并由内核 THP 配置决定。
 
 ## 压测
 
@@ -148,9 +151,19 @@ g++ -O2 -std=c++17 -pthread -I. benchmark/spsc_channel_stress.cpp -o /tmp/spsc_s
 # 进程间共享内存压测：父进程生产、子进程消费
 g++ -O2 -std=c++17 -pthread -I. benchmark/ipc_channel_benchmark.cpp -o /tmp/ipc_channel_bench
 /tmp/ipc_channel_bench 3             # 参数：时长（秒）
+
+# 端到端延迟：每 1024 条采样一次，输出 p50/p99/p999（默认 8 MiB ring）
+g++ -O2 -std=c++17 -pthread -Icore/ipc -Icore benchmark/latency_benchmark.cpp -o /tmp/latency_bench
+/tmp/latency_bench 30
+
+# 缺页和调度计数；对比旧版本时分别运行两个二进制，保持 CPU 亲和性一致
+sudo perf stat -e task-clock,context-switches,cpu-migrations,page-faults,minor-faults,major-faults \
+  taskset -c 0,1 /tmp/spsc_stress 30 5
 ```
 
 输出字段：`interval`、`spsc`（msg/s）、`bandwidth`（MiB/s）、`produced` / `consumed`、重试次数、`status`。
+
+建议至少覆盖以下场景：Thread 与 Shared、1 MiB 与 8 MiB ring、64/256/1024/4096 字节消息、冷启动首秒和 30 秒稳态。比较版本时固定 CPU 集合（`taskset`）、运行时长、编译器参数和后台负载；不要用中途 Ctrl-C 的结果做结论。延迟 benchmark 的 p999 是采样值，需结合完整 histogram 或提高采样率复核。
 
 最近一次 3 秒压测中，两种消费模式均通过数据完整性校验；pop_lock 在 64 字节块下吞吐约为普通 `try_pop` 的 2 倍，数据块增大后收益逐步收敛。
 

@@ -11,7 +11,8 @@ int main()
     assert(publisher.create(4096, topic, MemoryType::Thread) == 0);
 
     Subscriber subscriber;
-    assert(subscriber.subscribe(publisher.shared_memory()) == 0);
+    const SharedMemoryView view = publisher.shared_memory();
+    assert(subscriber.subscribe(view) == 0);
 
     const char message[] = "hello channel";
     assert(publisher.try_push(message, sizeof(message)) == 0);

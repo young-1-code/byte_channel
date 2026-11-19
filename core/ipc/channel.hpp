@@ -86,7 +86,6 @@ public:
     if (m_created)
       return channel_status::kInvalidArgument;
 
-    int actual_szie = buffer_size + sizeof(IPCHeadInfo);
     if (type == MemoryType::Thread) {
       int result = m_memory.create_thread_split(
           static_cast<size_t>(buffer_size), sizeof(IPCHeadInfo));
@@ -184,7 +183,8 @@ public:
 
         // 读写频率不高时候可以休眠下，降低CPU负载
         wpos = channel_atomic::load(&p_head->pub_pos);
-        if (has_active_subscriber && (wpos - min_pos) * 3 > mask) {
+        if (has_active_subscriber && (wpos - min_pos) * 3 >
+                                      static_cast<uint64_t>(mask)) {
           std::this_thread::sleep_for(std::chrono::nanoseconds(1));
         }
       }
@@ -209,7 +209,7 @@ public:
     }
     // 可写空间长度
     avialbe_wlen = m_buffer_size - avialbe_wlen;
-    if (avialbe_wlen < len) {
+    if (avialbe_wlen < static_cast<uint64_t>(len)) {
       //刷新数据
       m_wpos = channel_atomic::load(&p_head->pub_pos);
       m_rpos = min_sub_pos.load(std::memory_order_acquire);
@@ -221,7 +221,7 @@ public:
       }
       avialbe_wlen = m_buffer_size - avialbe_wlen;
       // 再次判断
-      if (avialbe_wlen < len) {
+      if (avialbe_wlen < static_cast<uint64_t>(len)) {
         // 可写入空间不足
         return channel_status::kWouldBlock;
       }
@@ -462,14 +462,14 @@ public:
 
     //本地缓存加载计算
     uint64_t avialbe_wlen = m_wpos - m_rpos;
-    if (avialbe_wlen < len) {
+    if (avialbe_wlen < static_cast<uint64_t>(len)) {
       // 远端数据更新计算
       m_wpos = channel_atomic::load(&p_head->pub_pos);
       m_rpos = channel_atomic::load(&item->sub_pos);
       // 再次计算
       avialbe_wlen = m_wpos - m_rpos;
       // 再次校验
-      if (avialbe_wlen < len) {
+      if (avialbe_wlen < static_cast<uint64_t>(len)) {
         // 可写入空间不足
         return channel_status::kWouldBlock;
       }
