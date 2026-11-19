@@ -7,6 +7,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <random>
 #include <sys/epoll.h>
 #include <thread>
@@ -19,6 +20,7 @@
 #include "udp_spsc_adapter.h"
 
 struct UdpSubscriber::Impl {
+  static constexpr size_t kMaxPendingRanges = 4096;
   UdpSubConfig config;
   UdpSpscPublisher output;
   UdpSpscSubscriber application;
@@ -43,6 +45,7 @@ struct UdpSubscriber::Impl {
   uint8_t nak_retries = 0;
   std::chrono::steady_clock::time_point next_nak{};
   std::chrono::steady_clock::time_point next_heartbeat{};
+  mutable std::mutex application_mutex;
 
   int Start(const UdpSubConfig &value) {
     if (thread.joinable() || value.topic.empty() ||
@@ -71,6 +74,7 @@ struct UdpSubscriber::Impl {
     }
     if (events.open() != 0 || events.add(data_socket.fd(), EPOLLIN) != 0 ||
         events.add(control_socket.fd(), EPOLLIN) != 0) {
+      events.close();
       data_socket.close();
       control_socket.close();
       return channel_status::kSystemError;
@@ -78,7 +82,12 @@ struct UdpSubscriber::Impl {
     if (config.data_mode == UdpDataMode::kMulticast &&
         btch::udp::system::join_multicast(data_socket.fd(), config.data_address,
                                           config.interface_address) != 0)
+    {
+      events.close();
+      data_socket.close();
+      control_socket.close();
       return channel_status::kSystemError;
+    }
     stop.store(false);
     next_setup = std::chrono::steady_clock::now();
     next_heartbeat = next_setup + std::chrono::seconds(1);
@@ -112,7 +121,7 @@ struct UdpSubscriber::Impl {
         if (length < 0)
           break;
         if (length >= static_cast<int>(btch::udp::kHeaderLength)) {
-          HandleData(packet.data(), length);
+          HandleData(packet.data(), length, source);
         }
       }
       for (int index = 0; index < 64; ++index) {
@@ -146,16 +155,21 @@ struct UdpSubscriber::Impl {
     }
   }
 
-  void HandleData(const uint8_t *bytes, size_t length) {
+  void HandleData(const uint8_t *bytes, size_t length,
+                  const sockaddr_in &source) {
     btch::udp::Header h;
     if (!btch::udp::decode_header(bytes, length, h) ||
         h.command != btch::udp::Command::kData ||
         h.topic_id != btch::udp::topic_id(config.topic) || h.stream_id == 0 ||
         h.payload_length == 0 || (stream_id != 0 && h.stream_id != stream_id) ||
+        h.payload_length > config.max_payload ||
         h.payload_length != length - btch::udp::kHeaderLength ||
         h.data_offset + h.payload_length < h.data_offset) {
       return;
     }
+    if (config.data_mode == UdpDataMode::kUnicast &&
+        source.sin_addr.s_addr != publisher.sin_addr.s_addr)
+      return;
     if ((h.flags & btch::udp::kFlagCrc32) != 0) {
       std::array<uint8_t, btch::udp::kHeaderLength + btch::udp::kMaxPayload>
           copy{};
@@ -190,6 +204,11 @@ struct UdpSubscriber::Impl {
         write_length);
     if (result != channel_status::kOk)
       return;
+    if (ranges.size() >= kMaxPendingRanges &&
+        ranges.find(write_offset) == ranges.end()) {
+      SendRst();
+      return;
+    }
     RecordRange(write_offset, packet_end);
     Advance();
     if (!ranges.empty() && !nak_scheduled) {
@@ -232,6 +251,7 @@ struct UdpSubscriber::Impl {
                                      h.payload_length, establish) ||
         establish.sub_id != config.sub_id)
       return;
+    std::lock_guard<std::mutex> application_lock(application_mutex);
     if (output.initialize_position(establish.start_offset) !=
             channel_status::kOk ||
         application.reset_consumer_position(establish.start_offset) !=
@@ -250,7 +270,7 @@ struct UdpSubscriber::Impl {
     pending_data.clear();
     pending_bytes = 0;
     for (const auto &data : pending)
-      HandleData(data.data(), data.size());
+      HandleData(data.data(), data.size(), publisher);
   }
 
   void RecordRange(uint64_t start, uint64_t end) {
@@ -313,8 +333,12 @@ struct UdpSubscriber::Impl {
   }
 
   void SendUpdate() {
-    btch::udp::UpdatePayload update{config.sub_id,
-                                    application.consumed_position()};
+    uint64_t consumed_position = 0;
+    {
+      std::lock_guard<std::mutex> lock(application_mutex);
+      consumed_position = application.consumed_position();
+    }
+    btch::udp::UpdatePayload update{config.sub_id, consumed_position};
     std::vector<uint8_t> body(12), packet(btch::udp::kHeaderLength + 12);
     btch::udp::encode_update(update, body.data(), body.size());
     btch::udp::Header h;
@@ -328,7 +352,7 @@ struct UdpSubscriber::Impl {
     std::memcpy(packet.data() + btch::udp::kHeaderLength, body.data(),
                 body.size());
     control_socket.send_to(publisher, packet.data(), packet.size());
-    last_update = application.consumed_position();
+    last_update = consumed_position;
   }
 
   void SendHeartbeat() {
@@ -419,13 +443,16 @@ struct UdpSubscriber::Impl {
     control_socket.send_to(publisher, packet.data(), packet.size());
   }
   void Close() {
-    if (established)
-      SendExit();
     stop.store(true);
     if (thread.joinable())
       thread.join();
+    // The network thread owns protocol state.  Send EXIT only after it has
+    // stopped so Close cannot race with HandleControl/HandleData.
+    if (established)
+      SendExit();
     data_socket.close();
     control_socket.close();
+    events.close();
     established = false;
   }
 };
@@ -436,15 +463,21 @@ int UdpSubscriber::subscribe(const UdpSubConfig &config) {
   return impl_->Start(config);
 }
 int UdpSubscriber::try_pop(char *data, int length) {
+  std::lock_guard<std::mutex> lock(impl_->application_mutex);
   return impl_->application.try_pop(data, length);
 }
 int UdpSubscriber::enable_pop_lock_mode(int max_length) {
+  std::lock_guard<std::mutex> lock(impl_->application_mutex);
   return impl_->application.enable_pop_lock_mode(max_length);
 }
 const char *UdpSubscriber::try_pop_lock(int length) {
+  std::lock_guard<std::mutex> lock(impl_->application_mutex);
   return impl_->application.try_pop_lock(length);
 }
-int UdpSubscriber::pop_unlock() { return impl_->application.pop_unlock(); }
+int UdpSubscriber::pop_unlock() {
+  std::lock_guard<std::mutex> lock(impl_->application_mutex);
+  return impl_->application.pop_unlock();
+}
 int UdpSubscriber::unsubscribe() {
   impl_->Close();
   return channel_status::kOk;

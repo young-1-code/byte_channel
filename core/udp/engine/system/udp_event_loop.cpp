@@ -8,16 +8,21 @@
 
 namespace btch::udp::system {
 
-UdpEventLoop::~UdpEventLoop() {
-  if (fd_ >= 0)
-    ::close(fd_);
-}
+UdpEventLoop::~UdpEventLoop() { close(); }
 
 int UdpEventLoop::open() {
   if (fd_ >= 0)
     return 0;
   fd_ = ::epoll_create1(EPOLL_CLOEXEC);
   return fd_ >= 0 ? 0 : -1;
+}
+
+int UdpEventLoop::close() {
+  if (fd_ >= 0) {
+    ::close(fd_);
+    fd_ = -1;
+  }
+  return 0;
 }
 
 int UdpEventLoop::add(int fd, uint32_t events) {

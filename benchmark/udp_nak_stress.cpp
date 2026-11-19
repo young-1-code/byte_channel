@@ -112,7 +112,17 @@ int main(int argc, char** argv) {
     uint64_t timestamp = 0;
     std::memcpy(&sequence, received.data(), sizeof(sequence));
     std::memcpy(&timestamp, received.data() + sizeof(sequence), sizeof(timestamp));
-    if (sequence != consumed) ++bad_records;
+    if (sequence != consumed) {
+      ++bad_records;
+    } else {
+      for (size_t index = 16; index < received.size(); ++index) {
+        const char expected = static_cast<char>((sequence + index * 31) & 0xff);
+        if (received[index] != expected) {
+          ++bad_records;
+          break;
+        }
+      }
+    }
     ++consumed;
     const uint64_t latency = now_ns() - timestamp;
     latency_sum_ns += latency;
@@ -134,6 +144,8 @@ int main(int argc, char** argv) {
       std::memcpy(record.data(), &sequence, sizeof(sequence));
       const uint64_t timestamp = now_ns();
       std::memcpy(record.data() + sizeof(sequence), &timestamp, sizeof(timestamp));
+      for (size_t index = 16; index < record.size(); ++index)
+        record[index] = static_cast<char>((sequence + index * 31) & 0xff);
       const int result = publisher.try_push(record.data(), options.payload);
       if (result == channel_status::kOk) {
         ++sequence;

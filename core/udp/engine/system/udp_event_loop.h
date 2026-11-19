@@ -18,6 +18,7 @@ public:
   UdpEventLoop &operator=(const UdpEventLoop &) = delete;
 
   int open();
+  int close();
   int add(int fd, uint32_t events);
   int remove(int fd);
   int wait(UdpEvent *output, size_t capacity, int timeout_ms);

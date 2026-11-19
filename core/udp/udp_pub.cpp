@@ -83,6 +83,7 @@ struct UdpPublisher::Impl {
       return channel_status::kSystemError;
     }
     if (events.open() != 0 || events.add(control_socket.fd(), EPOLLIN) != 0) {
+      events.close();
       data_socket.close();
       control_socket.close();
       return channel_status::kSystemError;
@@ -93,7 +94,12 @@ struct UdpPublisher::Impl {
         !config.interface_address.empty() &&
         btch::udp::system::set_multicast_interface(
             data_socket.fd(), config.interface_address) != 0)
+    {
+      events.close();
+      data_socket.close();
+      control_socket.close();
       return channel_status::kInvalidArgument;
+    }
     stop.store(false);
     created = true;
     thread = std::thread([this] { Run(); });
@@ -373,6 +379,7 @@ struct UdpPublisher::Impl {
       thread.join();
     data_socket.close();
     control_socket.close();
+    events.close();
     subscribers.clear();
     retention.clear();
     created = false;
