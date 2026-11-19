@@ -26,9 +26,12 @@ header-only 的 C++17 字节流通道库。基于无锁环形缓冲区提供线�
 ## 快速开始
 
 ```bash
-g++ -O2 -std=c++17 -pthread -I. example/channel_example.cpp -o /tmp/channel_example
-/tmp/channel_example
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/channel_example
 ```
+
+CMake 会生成所有 example 和 benchmark 目标，包括 `channel_benchmark`、`ipc_channel_benchmark`、`latency_benchmark`、`spsc_channel_stress`、`spsc_pop_lock_benchmark`、`udp_nak_example` 和 `udp_nak_stress`。头文件库目标名为 `byte_channel`，下游项目可以通过 `add_subdirectory` 后链接它。
 
 ### 通用通道（进程内，单生产者多消费者）
 
@@ -136,25 +139,24 @@ while (running) {
 ## 压测
 
 ```bash
+# 使用 CMake 构建
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
 # 通用 vs SPSC、copy vs pop_lock，块大小 64 / 256 / 1024 / 4096
-g++ -O2 -std=c++17 -pthread -I. benchmark/spsc_pop_lock_benchmark.cpp -o /tmp/pop_lock_bench
-/tmp/pop_lock_bench 3 1048576     # 参数：时长（秒）、pop-lock 单块上限
+./build/spsc_pop_lock_benchmark 3 1048576
 
 # SPSC 连续压测（周期输出 msg/s 与 MiB/s）
-g++ -O2 -std=c++17 -pthread -I. benchmark/channel_benchmark.cpp -o /tmp/channel_bench
-/tmp/channel_bench 10 1           # 参数：时长（秒）、报表间隔（秒）
+./build/channel_benchmark 10 1    # 参数：时长（秒）、报表间隔（秒）
 
 # SPSC 压力测试（含数据完整性校验）
-g++ -O2 -std=c++17 -pthread -I. benchmark/spsc_channel_stress.cpp -o /tmp/spsc_stress
-/tmp/spsc_stress 10 1
+./build/spsc_channel_stress 10 1
 
 # 进程间共享内存压测：父进程生产、子进程消费
-g++ -O2 -std=c++17 -pthread -I. benchmark/ipc_channel_benchmark.cpp -o /tmp/ipc_channel_bench
-/tmp/ipc_channel_bench 3             # 参数：时长（秒）
+./build/ipc_channel_benchmark 3     # 参数：时长（秒）
 
 # 端到端延迟：每 1024 条采样一次，输出 p50/p99/p999（默认 8 MiB ring）
-g++ -O2 -std=c++17 -pthread -Icore/ipc -Icore benchmark/latency_benchmark.cpp -o /tmp/latency_bench
-/tmp/latency_bench 30
+./build/latency_benchmark 30
 
 # 缺页和调度计数；对比旧版本时分别运行两个二进制，保持 CPU 亲和性一致
 sudo perf stat -e task-clock,context-switches,cpu-migrations,page-faults,minor-faults,major-faults \

@@ -5,18 +5,12 @@
 在仓库根目录执行：
 
 ```bash
-g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wno-stringop-truncation -pthread -I. -Icore \
-  example/udp_nak_example.cpp \
-  core/udp/proto.cpp core/udp/engine/system/udp_socket.cpp \
-  core/udp/engine/system/udp_endpoint.cpp core/udp/engine/system/udp_event_loop.cpp \
-  core/udp/udp_pub.cpp core/udp/udp_sub.cpp -o /tmp/udp_nak_example
-
-g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wno-stringop-truncation -pthread -I. -Icore \
-  benchmark/udp_nak_stress.cpp \
-  core/udp/proto.cpp core/udp/engine/system/udp_socket.cpp \
-  core/udp/engine/system/udp_endpoint.cpp core/udp/engine/system/udp_event_loop.cpp \
-  core/udp/udp_pub.cpp core/udp/udp_sub.cpp -o /tmp/udp_nak_stress
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 ```
+
+UDP 示例和压测目标分别是 `build/udp_nak_example` 和
+`build/udp_nak_stress`；其他 byte channel benchmark 也会同时生成。
 
 ## 运行
 
